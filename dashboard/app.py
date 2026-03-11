@@ -106,6 +106,8 @@ def api_positions():
                 "entryPrice": entry,
                 "qty": amt,
                 "markPrice": mark,
+                "cost": round(abs(entry * amt), 4),
+                "value": round(abs(mark * amt), 4),
                 "pnlUsdt": round(pnl, 4),
                 "pnlPct": round(pnl_pct, 2),
                 "leverage": safe_leverage(p),
@@ -183,8 +185,8 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
 <div class="card" style="margin-bottom:16px">
   <h2>Open Positions</h2>
   <table>
-    <thead><tr><th>Symbol</th><th>Entry</th><th>Qty</th><th>Mark</th><th>PnL (USDT)</th><th>PnL %</th><th>Leverage</th></tr></thead>
-    <tbody id="pos"><tr><td colspan="7" class="loader">Loading...</td></tr></tbody>
+    <thead><tr><th>Symbol</th><th>Entry</th><th>Qty</th><th>Mark</th><th>PnL (USDT)</th><th>PnL %</th><th>Leverage</th><th>Cost</th><th>Value</th></tr></thead>
+    <tbody id="pos"><tr><td colspan="9" class="loader">Loading...</td></tr></tbody>
   </table>
 </div>
 
@@ -223,14 +225,16 @@ async function loadBalance() {
 
 async function loadPositions() {
   const d = await fetchJSON('/api/positions');
-  if (d.error) { $('pos').innerHTML = '<tr><td colspan="7" class="neg">Error</td></tr>'; return; }
-  if (!d.length) { $('pos').innerHTML = '<tr><td colspan="7" style="color:#484f58">No open positions</td></tr>'; return; }
+  if (d.error) { $('pos').innerHTML = '<tr><td colspan="9" class="neg">Error</td></tr>'; return; }
+  if (!d.length) { $('pos').innerHTML = '<tr><td colspan="9" style="color:#484f58">No open positions</td></tr>'; return; }
   $('pos').innerHTML = d.map(p => `<tr>
     <td>${p.symbol}</td><td>${fmt(p.entryPrice,4)}</td><td>${fmt(p.qty,4)}</td>
     <td>${fmt(p.markPrice,4)}</td>
     <td class="${cls(p.pnlUsdt)}">${fmt(p.pnlUsdt)}</td>
     <td class="${cls(p.pnlPct)}">${fmt(p.pnlPct)}%</td>
-    <td>${p.leverage}x</td></tr>`).join('');
+    <td>${p.leverage}x</td>
+    <td>${fmt(p.cost)}</td>
+    <td>${fmt(p.value)}</td></tr>`).join('');
 }
 
 async function loadTrades() {
