@@ -185,6 +185,11 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
 </div>
 
 <div class="card" style="margin-bottom:16px">
+  <h2>Last Refresh</h2>
+  <div id="last-refresh" class="loader">Loading...</div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
   <h2>Open Positions</h2>
   <table>
     <thead><tr><th>Symbol</th><th>Entry</th><th>Qty</th><th>Mark</th><th>PnL (USDT)</th><th>PnL %</th><th>Leverage</th><th>Cost</th><th>Value</th></tr></thead>
@@ -209,6 +214,19 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
 const $ = s => document.getElementById(s);
 const fmt = (v,d=2) => v!=null ? Number(v).toFixed(d) : '-';
 const cls = v => v >= 0 ? 'pos' : 'neg';
+
+function updateLastRefresh() {
+  const now = new Date();
+  $('last-refresh').textContent = now.toLocaleString('en-GB', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+}
 
 async function fetchJSON(url) {
   try { const r = await fetch(url); return await r.json(); }
@@ -293,6 +311,7 @@ async function loadEquity() {
 
 async function refresh() {
   await Promise.all([loadBalance(), loadPositions(), loadTrades(), loadEquity()]);
+  updateLastRefresh();
 }
 refresh();
 setInterval(refresh, 30000);
