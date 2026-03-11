@@ -4,14 +4,19 @@ AKQ Futures Executor — 真实币安U本位合约交易
   python3 akq_futures.py buy ETHUSDT 20 3 2.0 4.0
   python3 akq_futures.py sell ETHUSDT
   python3 akq_futures.py status
+  python3 akq_futures.py snapshot
 """
 
 import sys
 import re
 import json
 import math
+import sqlite3
+from datetime import datetime, timezone
 from binance.client import Client
 from binance.enums import *
+
+DB_PATH = "/home/azureuser/akq-trader/trades.db"
 
 # ── 加载 API Key ─────────────────────────────────────────
 def load_env(path="/home/azureuser/.benv"):
@@ -22,6 +27,36 @@ def load_env(path="/home/azureuser/.benv"):
 
 KEY, SECRET = load_env()
 client = Client(KEY, SECRET)
+
+# ── SQLite ────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        open_time TEXT,
+        close_time TEXT,
+        symbol TEXT,
+        side TEXT DEFAULT 'LONG',
+        qty REAL,
+        entry_price REAL,
+        exit_price REAL,
+        leverage INTEGER,
+        sl_price REAL,
+        tp_price REAL,
+        status TEXT DEFAULT 'OPEN',
+        margin_usdt REAL,
+        pnl_usdt REAL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS equity_curve (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time TEXT,
+        equity REAL
+    )""")
+    conn.commit()
+    conn.close()
+
+init_db()
 
 # ── 工具函数 ─────────────────────────────────────────────
 def get_symbol_info(symbol):
@@ -111,6 +146,19 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
         "leverage": leverage,
         "usdt_margin": usdt_amount,
     }
+
+    # 写入交易记录
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO trades (open_time, symbol, side, qty, entry_price, leverage, sl_price, tp_price, status, margin_usdt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), symbol, "LONG", qty, entry_price, leverage, sl_price, tp_price, "OPEN", usdt_amount)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] 写入失败: {e}")
+
     print(json.dumps(result, indent=2))
     return result
 
@@ -128,6 +176,7 @@ def sell(symbol: str) -> dict:
         return {"status": "no_position"}
 
     qty = float(pos["positionAmt"])
+    entry_price = float(pos["entryPrice"])
     order = client.futures_create_order(
         symbol=symbol,
         side=SIDE_SELL,
@@ -135,10 +184,33 @@ def sell(symbol: str) -> dict:
         quantity=qty,
         reduceOnly=True,
     )
+    exit_price = float(order.get("avgPrice") or get_mark_price(symbol))
+    pnl = (exit_price - entry_price) * qty
+
+    # 更新交易记录 + 记录权益曲线
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "UPDATE trades SET close_time=?, exit_price=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
+            (datetime.now(timezone.utc).isoformat(), exit_price, pnl, symbol)
+        )
+        # 记录权益曲线
+        balances = client.futures_account_balance()
+        usdt_bal = next((b for b in balances if b["asset"] == "USDT"), None)
+        if usdt_bal:
+            conn.execute("INSERT INTO equity_curve (time, equity) VALUES (?,?)",
+                         (datetime.now(timezone.utc).isoformat(), float(usdt_bal["balance"])))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] 更新失败: {e}")
+
     result = {
         "status": "closed",
         "symbol": symbol,
         "qty": qty,
+        "exit_price": exit_price,
+        "pnl_usdt": round(pnl, 4),
         "order_id": order["orderId"],
     }
     print(json.dumps(result, indent=2))
@@ -170,6 +242,33 @@ def status():
         print(f"{o['symbol']} {o['type']} {o['side']} stop={o.get('stopPrice','N/A')}")
 
 
+def snapshot_equity():
+    """记录当前总权益（walletBalance + unrealizedPnL）到 equity_curve"""
+    balances = client.futures_account_balance()
+    usdt = next((b for b in balances if b["asset"] == "USDT"), None)
+    account = client.futures_account()
+
+    wallet_balance = float(usdt["balance"]) if usdt else float(account.get("totalWalletBalance", 0))
+    unrealized_pnl = float(account.get("totalUnrealizedProfit", 0))
+    equity = wallet_balance + unrealized_pnl
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO equity_curve (time, equity) VALUES (?, ?)", (now, equity))
+    conn.commit()
+    conn.close()
+
+    result = {
+        "status": "ok",
+        "time": now,
+        "wallet_balance": round(wallet_balance, 8),
+        "unrealized_pnl": round(unrealized_pnl, 8),
+        "equity": round(equity, 8),
+    }
+    print(json.dumps(result, indent=2))
+    return result
+
+
 # ── CLI 入口 ─────────────────────────────────────────────
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -193,6 +292,9 @@ if __name__ == "__main__":
 
     elif cmd == "status":
         status()
+
+    elif cmd == "snapshot":
+        snapshot_equity()
 
     else:
         print(f"未知命令: {cmd}")
