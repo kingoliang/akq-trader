@@ -101,16 +101,18 @@ def api_positions():
             pnl_pct = ((mark - entry) / entry * 100) if entry else 0
             if amt < 0:
                 pnl_pct = -pnl_pct
+            leverage = safe_leverage(p)
+            notional_entry = abs(entry * amt)
             active.append({
                 "symbol": p["symbol"],
                 "entryPrice": entry,
                 "qty": amt,
                 "markPrice": mark,
-                "cost": round(abs(entry * amt), 4),
+                "cost": round(notional_entry / leverage, 4) if leverage else round(notional_entry, 4),
                 "value": round(abs(mark * amt), 4),
                 "pnlUsdt": round(pnl, 4),
                 "pnlPct": round(pnl_pct, 2),
-                "leverage": safe_leverage(p),
+                "leverage": leverage,
             })
         return jsonify(active)
     except Exception as e:
