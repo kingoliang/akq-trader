@@ -155,6 +155,8 @@ HTML_PAGE = """<!DOCTYPE html>
 body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',system-ui,sans-serif;padding:20px}
 h1{color:#58a6ff;margin-bottom:18px;font-size:1.5rem}
 h2{color:#8b949e;font-size:1.1rem;margin-bottom:10px;border-bottom:1px solid #21262d;padding-bottom:6px}
+.header-row{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.header-meta{font-size:.75rem;color:#6e7681;white-space:nowrap}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
 .card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px}
 .full{grid-column:1/-1}
@@ -173,6 +175,11 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
 <body>
 <h1>AKQ Futures Dashboard</h1>
 
+<div class="header-row">
+  <h2 style="margin-bottom:16px;border-bottom:none;padding-bottom:0">Dashboard Overview</h2>
+  <div id="last-refresh" class="header-meta">Last refresh: Loading...</div>
+</div>
+
 <div class="grid">
   <div class="card">
     <h2>Account Balance</h2>
@@ -182,11 +189,6 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
     <h2>Statistics</h2>
     <div class="stat-row" id="stats"><span class="loader">Loading...</span></div>
   </div>
-</div>
-
-<div class="card" style="margin-bottom:16px">
-  <h2>Last Refresh</h2>
-  <div id="last-refresh" class="loader">Loading...</div>
 </div>
 
 <div class="card" style="margin-bottom:16px">
@@ -217,7 +219,7 @@ const cls = v => v >= 0 ? 'pos' : 'neg';
 
 function updateLastRefresh() {
   const now = new Date();
-  $('last-refresh').textContent = now.toLocaleString('en-GB', {
+  const ts = now.toLocaleString('en-GB', {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -226,6 +228,7 @@ function updateLastRefresh() {
     second: '2-digit',
     hour12: false,
   });
+  $('last-refresh').textContent = `Last refresh: ${ts}`;
 }
 
 async function fetchJSON(url) {
