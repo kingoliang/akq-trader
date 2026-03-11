@@ -156,7 +156,7 @@ body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',system-ui,sans-seri
 h1{color:#58a6ff;margin-bottom:18px;font-size:1.5rem}
 h2{color:#8b949e;font-size:1.1rem;margin-bottom:10px;border-bottom:1px solid #21262d;padding-bottom:6px}
 .header-row{display:flex;justify-content:space-between;align-items:center;gap:12px}
-.header-meta{font-size:.75rem;color:#6e7681;white-space:nowrap}
+.header-meta{font-size:.75rem;color:#6e7681;white-space:nowrap;position:fixed;top:10px;right:16px;z-index:1000;background:rgba(13,17,23,.85);padding:2px 6px;border-radius:4px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
 .card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px}
 .full{grid-column:1/-1}
@@ -175,10 +175,7 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
 <body>
 <h1>AKQ Futures Dashboard</h1>
 
-<div class="header-row">
-  <h2 style="margin-bottom:16px;border-bottom:none;padding-bottom:0">Dashboard Overview</h2>
-  <div id="last-refresh" class="header-meta">Last refresh: Loading...</div>
-</div>
+<div id="last-refresh" class="header-meta">Last refresh: Loading...</div>
 
 <div class="grid">
   <div class="card">
