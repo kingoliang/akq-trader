@@ -129,24 +129,26 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
     tp_price = round_step(entry_price * (1 + tp_pct / 100), info["tickSize"])
 
     # 5. 挂止损单 (STOP_MARKET) / 止盈单 (TAKE_PROFIT_MARKET)
-    # hedge mode 下必须带 positionSide=LONG
-    client.futures_create_order(
+    # 不再使用 closePosition=True，改为指定数量，确保 open_orders 可见、可核验
+    sl_order = client.futures_create_order(
         symbol=symbol,
         side=SIDE_SELL,
         positionSide="LONG",
         type="STOP_MARKET",
+        quantity=qty,
         stopPrice=sl_price,
-        closePosition=True,
+        reduceOnly=True,
         timeInForce="GTE_GTC",
     )
 
-    client.futures_create_order(
+    tp_order = client.futures_create_order(
         symbol=symbol,
         side=SIDE_SELL,
         positionSide="LONG",
         type="TAKE_PROFIT_MARKET",
+        quantity=qty,
         stopPrice=tp_price,
-        closePosition=True,
+        reduceOnly=True,
         timeInForce="GTE_GTC",
     )
 
@@ -159,6 +161,8 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
         "tp_price": tp_price,
         "leverage": leverage,
         "usdt_margin": usdt_amount,
+        "sl_order_id": sl_order.get("orderId"),
+        "tp_order_id": tp_order.get("orderId"),
     }
 
     # 写入交易记录
@@ -200,7 +204,7 @@ def sell(symbol: str) -> dict:
         "type": FUTURE_ORDER_TYPE_MARKET,
         "quantity": qty,
     }
-    # hedge mode 必须带 positionSide，且不需要 reduceOnly
+    # hedge mode 必须带 positionSide；单向模式则使用 reduceOnly
     if pos.get("positionSide") in {"LONG", "SHORT"}:
         order_params["positionSide"] = pos["positionSide"]
     else:
