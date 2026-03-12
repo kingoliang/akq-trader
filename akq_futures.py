@@ -3,6 +3,7 @@ AKQ Futures Executor — 真实币安U本位合约交易
 用法:
   python3 akq_futures.py buy ETHUSDT 20 3 2.0 4.0
   python3 akq_futures.py sell ETHUSDT
+  python3 akq_futures.py close ETHUSDT
   python3 akq_futures.py status
   python3 akq_futures.py snapshot
 """
@@ -164,27 +165,48 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
 
 
 def sell(symbol: str) -> dict:
-    """市价平掉 symbol 所有多仓，并取消相关止损止盈单"""
+    """市价平掉 symbol 的 LONG 仓位；兼容 hedge mode。"""
     # 取消所有挂单
     client.futures_cancel_all_open_orders(symbol=symbol)
 
-    # 查询持仓
+    # 查询持仓（优先找 hedge mode 的 LONG 仓）
     positions = client.futures_position_information(symbol=symbol)
-    pos = next((p for p in positions if float(p["positionAmt"]) > 0), None)
+    pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
+    if not pos:
+        # 兼容单向持仓模式
+        pos = next((p for p in positions if float(p["positionAmt"]) > 0), None)
     if not pos:
         print(json.dumps({"status": "no_position", "symbol": symbol}))
         return {"status": "no_position"}
 
-    qty = float(pos["positionAmt"])
+    qty = abs(float(pos["positionAmt"]))
     entry_price = float(pos["entryPrice"])
-    order = client.futures_create_order(
-        symbol=symbol,
-        side=SIDE_SELL,
-        type=FUTURE_ORDER_TYPE_MARKET,
-        quantity=qty,
-        reduceOnly=True,
-    )
-    exit_price = float(order.get("avgPrice") or get_mark_price(symbol))
+    order_params = {
+        "symbol": symbol,
+        "side": SIDE_SELL,
+        "type": FUTURE_ORDER_TYPE_MARKET,
+        "quantity": qty,
+    }
+    # hedge mode 必须带 positionSide，且不需要 reduceOnly
+    if pos.get("positionSide") in {"LONG", "SHORT"}:
+        order_params["positionSide"] = pos["positionSide"]
+    else:
+        order_params["reduceOnly"] = True
+
+    order = client.futures_create_order(**order_params)
+
+    # 尝试从成交回报里拿真实成交价；没有再退回 avgPrice / markPrice
+    exit_price = None
+    try:
+        trades = client.futures_account_trades(symbol=symbol, limit=10)
+        trade = next((t for t in reversed(trades) if str(t.get("orderId")) == str(order.get("orderId"))), None)
+        if trade:
+            exit_price = float(trade["price"])
+    except Exception:
+        pass
+    if exit_price is None:
+        exit_price = float(order.get("avgPrice") or get_mark_price(symbol))
+
     pnl = (exit_price - entry_price) * qty
 
     # 更新交易记录 + 记录权益曲线
@@ -286,7 +308,7 @@ if __name__ == "__main__":
         tp_pct     = float(sys.argv[6])
         buy(symbol, usdt_amt, leverage, sl_pct, tp_pct)
 
-    elif cmd == "sell":
+    elif cmd in {"sell", "close"}:
         symbol = sys.argv[2].upper()
         sell(symbol)
 
