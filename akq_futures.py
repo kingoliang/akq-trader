@@ -103,34 +103,47 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
     if qty <= 0:
         raise ValueError(f"数量过小: {qty} (notional={notional}, mark={mark})")
 
-    # 3. 市价开多
+    # 3. 市价开多（兼容 hedge mode）
     order = client.futures_create_order(
         symbol=symbol,
         side=SIDE_BUY,
+        positionSide="LONG",
         type=FUTURE_ORDER_TYPE_MARKET,
         quantity=qty,
     )
-    entry_price = float(order.get("avgPrice") or mark)
+
+    entry_price = None
+    try:
+        trades = client.futures_account_trades(symbol=symbol, limit=10)
+        trade = next((t for t in reversed(trades) if str(t.get("orderId")) == str(order.get("orderId"))), None)
+        if trade:
+            entry_price = float(trade["price"])
+    except Exception:
+        pass
+    if entry_price is None:
+        entry_price = float(order.get("avgPrice") or mark)
     order_id = order["orderId"]
 
     # 4. 计算 SL/TP 价格
     sl_price = round_step(entry_price * (1 - sl_pct / 100), info["tickSize"])
     tp_price = round_step(entry_price * (1 + tp_pct / 100), info["tickSize"])
 
-    # 5. 挂止损单 (STOP_MARKET)
+    # 5. 挂止损单 (STOP_MARKET) / 止盈单 (TAKE_PROFIT_MARKET)
+    # hedge mode 下必须带 positionSide=LONG
     client.futures_create_order(
         symbol=symbol,
         side=SIDE_SELL,
+        positionSide="LONG",
         type="STOP_MARKET",
         stopPrice=sl_price,
         closePosition=True,
         timeInForce="GTE_GTC",
     )
 
-    # 6. 挂止盈单 (TAKE_PROFIT_MARKET)
     client.futures_create_order(
         symbol=symbol,
         side=SIDE_SELL,
+        positionSide="LONG",
         type="TAKE_PROFIT_MARKET",
         stopPrice=tp_price,
         closePosition=True,
