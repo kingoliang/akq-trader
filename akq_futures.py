@@ -1,11 +1,14 @@
 """
 AKQ Futures Executor — 真实币安U本位合约交易
 用法:
-  python3 akq_futures.py buy ETHUSDT 20 3 2.0 4.0
-  python3 akq_futures.py sell ETHUSDT
-  python3 akq_futures.py close ETHUSDT
+  python3 akq_futures.py buy ETHUSDT 20 3 2.0 4.0   # 做多
+  python3 akq_futures.py sell ETHUSDT                # 平多仓
+  python3 akq_futures.py close ETHUSDT               # 平多仓（别名）
+  python3 akq_futures.py short ETHUSDT 20 2 2.0 4.0  # 做空
+  python3 akq_futures.py cover ETHUSDT               # 平空仓
   python3 akq_futures.py status
   python3 akq_futures.py snapshot
+  python3 akq_futures.py sync [SYMBOL] [LIMIT]
 """
 
 import sys
@@ -323,21 +326,199 @@ def status():
             )
 
 
+def short(symbol: str, usdt_amount: float, leverage: int,
+          sl_pct: float, tp_pct: float) -> dict:
+    """
+    市价开空仓 + 挂止损止盈单
+    sl_pct: 止损幅度（价格上涨%），如 2.0 表示入场价 +2% 触发止损
+    tp_pct: 止盈幅度（价格下跌%），如 4.0 表示入场价 -4% 触发止盈
+    返回 dict: order_id, entry_price, sl_price, tp_price, qty
+    """
+    # 安全检查：如有同标的多仓，拒绝开空
+    positions = client.futures_position_information(symbol=symbol)
+    long_pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
+    if long_pos:
+        raise ValueError(f"[安全阻断] {symbol} 存在多仓 qty={long_pos['positionAmt']}，请先平多仓再开空")
+
+    info = get_symbol_info(symbol)
+    client.futures_change_leverage(symbol=symbol, leverage=leverage)
+
+    mark = get_mark_price(symbol)
+    notional = usdt_amount * leverage
+    qty = round_step(notional / mark, info["stepSize"])
+    if qty <= 0:
+        raise ValueError(f"数量过小: {qty} (notional={notional}, mark={mark})")
+
+    # 市价开空（hedge mode: side=SELL + positionSide=SHORT）
+    order = client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_SELL,
+        positionSide="SHORT",
+        type=FUTURE_ORDER_TYPE_MARKET,
+        quantity=qty,
+    )
+
+    entry_price = None
+    try:
+        trades = client.futures_account_trades(symbol=symbol, limit=10)
+        trade = next((t for t in reversed(trades) if str(t.get("orderId")) == str(order.get("orderId"))), None)
+        if trade:
+            entry_price = float(trade["price"])
+    except Exception:
+        pass
+    if entry_price is None:
+        entry_price = float(order.get("avgPrice") or mark)
+    order_id = order["orderId"]
+
+    # 做空：SL = 价格上涨 sl_pct%，TP = 价格下跌 tp_pct%
+    sl_price = round_step(entry_price * (1 + sl_pct / 100), info["tickSize"])
+    tp_price = round_step(entry_price * (1 - tp_pct / 100), info["tickSize"])
+
+    # 止损单：STOP_MARKET，空仓平仓用 BUY + positionSide=SHORT
+    sl_order = client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_BUY,
+        positionSide="SHORT",
+        type="STOP_MARKET",
+        stopPrice=sl_price,
+        closePosition=True,
+        workingType="MARK_PRICE",
+    )
+
+    # 止盈单：TAKE_PROFIT_MARKET，市价平仓
+    tp_order = client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_BUY,
+        positionSide="SHORT",
+        type="TAKE_PROFIT_MARKET",
+        stopPrice=tp_price,
+        closePosition=True,
+        workingType="MARK_PRICE",
+    )
+
+    result = {
+        "order_id": order_id,
+        "symbol": symbol,
+        "direction": "SHORT",
+        "qty": qty,
+        "entry_price": entry_price,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "leverage": leverage,
+        "usdt_margin": usdt_amount,
+        "sl_order_id": sl_order.get("orderId"),
+        "tp_order_id": tp_order.get("orderId"),
+    }
+
+    # 写入交易记录
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO trades (open_time, symbol, side, qty, entry_price, leverage, sl_price, tp_price, status, margin_usdt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), symbol, "SHORT", qty, entry_price, leverage, sl_price, tp_price, "OPEN", usdt_amount)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] 写入失败: {e}")
+
+    print(json.dumps(result, indent=2))
+    return result
+
+
+def cover(symbol: str) -> dict:
+    """市价平掉 symbol 的 SHORT 仓位；兼容 hedge mode。"""
+    client.futures_cancel_all_open_orders(symbol=symbol)
+
+    positions = client.futures_position_information(symbol=symbol)
+    pos = next((p for p in positions if p.get("positionSide") == "SHORT" and float(p["positionAmt"]) < 0), None)
+    if not pos:
+        print(json.dumps({"status": "no_short_position", "symbol": symbol}))
+        return {"status": "no_short_position"}
+
+    qty = abs(float(pos["positionAmt"]))
+    entry_price = float(pos["entryPrice"])
+
+    order = client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_BUY,
+        positionSide="SHORT",
+        type=FUTURE_ORDER_TYPE_MARKET,
+        quantity=qty,
+    )
+
+    exit_price = None
+    try:
+        trades = client.futures_account_trades(symbol=symbol, limit=10)
+        trade = next((t for t in reversed(trades) if str(t.get("orderId")) == str(order.get("orderId"))), None)
+        if trade:
+            exit_price = float(trade["price"])
+    except Exception:
+        pass
+    if exit_price is None:
+        exit_price = float(order.get("avgPrice") or get_mark_price(symbol))
+
+    # 做空盈亏：入场价 - 平仓价（价格下跌=盈利）
+    pnl = (entry_price - exit_price) * qty
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "UPDATE trades SET close_time=?, exit_price=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND side='SHORT' AND status='OPEN' ORDER BY id DESC LIMIT 1",
+            (datetime.now(timezone.utc).isoformat(), exit_price, pnl, symbol)
+        )
+        balances = client.futures_account_balance()
+        usdt_bal = next((b for b in balances if b["asset"] == "USDT"), None)
+        if usdt_bal:
+            conn.execute("INSERT INTO equity_curve (time, equity) VALUES (?,?)",
+                         (datetime.now(timezone.utc).isoformat(), float(usdt_bal["balance"])))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] 更新失败: {e}")
+
+    result = {
+        "status": "covered",
+        "symbol": symbol,
+        "direction": "SHORT",
+        "qty": qty,
+        "exit_price": exit_price,
+        "pnl_usdt": round(pnl, 4),
+        "order_id": order["orderId"],
+    }
+    print(json.dumps(result, indent=2))
+    return result
+
+
 def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
     """
-    从 Binance 成交历史补录未入库的平仓记录。
-    匹配逻辑：BUY(开仓) + 对应的 SELL(平仓)，
-    若 DB 里 trades 表中不存在该开仓时间段的 CLOSED 记录，则插入。
+    从 Binance 成交历史补录未入库的平仓记录（LONG/SHORT 兼容）。
+    识别规则：
+      - LONG 开仓:  BUY + positionSide=LONG
+      - LONG 平仓:  SELL + positionSide=LONG
+      - SHORT 开仓: SELL + positionSide=SHORT
+      - SHORT 平仓: BUY + positionSide=SHORT
     """
     raw = client.futures_account_trades(symbol=symbol, limit=limit)
 
-    # 按 orderId 聚合（同一订单可能多笔成交）
     from collections import defaultdict
-    order_map = defaultdict(lambda: {"side": None, "qty": 0.0, "pnl": 0.0, "price_sum": 0.0, "qty_sum": 0.0, "time": None})
+
+    # 按 orderId 聚合（同一订单可能多笔成交）
+    order_map = defaultdict(lambda: {
+        "side": None,
+        "positionSide": None,
+        "qty": 0.0,
+        "pnl": 0.0,
+        "price_sum": 0.0,
+        "qty_sum": 0.0,
+        "time": None,
+    })
+
     for t in raw:
         oid = t["orderId"]
         entry = order_map[oid]
         entry["side"] = t["side"]
+        entry["positionSide"] = t.get("positionSide") or "BOTH"
         qty = float(t["qty"])
         price = float(t["price"])
         pnl = float(t["realizedPnl"])
@@ -348,45 +529,57 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
         if entry["time"] is None:
             entry["time"] = t["time"]
 
-    # 建立 (BUY, SELL) 配对列表
-    buys = [(oid, d) for oid, d in order_map.items() if d["side"] == "BUY"]
-    sells = [(oid, d) for oid, d in order_map.items() if d["side"] == "SELL"]
+    # 分方向构建开仓/平仓集合
+    long_opens, long_closes = [], []
+    short_opens, short_closes = [], []
 
-    # 按时间排序
-    buys.sort(key=lambda x: x[1]["time"])
-    sells.sort(key=lambda x: x[1]["time"])
+    for oid, d in order_map.items():
+        side = d["side"]
+        pos_side = d["positionSide"]
+        if side == "BUY" and pos_side == "LONG":
+            long_opens.append((oid, d))
+        elif side == "SELL" and pos_side == "LONG":
+            long_closes.append((oid, d))
+        elif side == "SELL" and pos_side == "SHORT":
+            short_opens.append((oid, d))
+        elif side == "BUY" and pos_side == "SHORT":
+            short_closes.append((oid, d))
+
+    long_opens.sort(key=lambda x: x[1]["time"])
+    long_closes.sort(key=lambda x: x[1]["time"])
+    short_opens.sort(key=lambda x: x[1]["time"])
+    short_closes.sort(key=lambda x: x[1]["time"])
+
+    def find_last_open(opens, close_time_ms):
+        for _, od in reversed(opens):
+            if od["time"] < close_time_ms:
+                return od
+        return None
 
     conn = sqlite3.connect(DB_PATH)
     inserted = 0
-    for sell_oid, sell_d in sells:
-        exit_price = sell_d["price_sum"] / sell_d["qty_sum"]
-        exit_time = datetime.fromtimestamp(sell_d["time"] / 1000, tz=timezone.utc).isoformat()
-        pnl = sell_d["pnl"]
 
-        # 检查 DB 是否已有对应记录（按 exit_price 和 symbol 模糊匹配）
+    def insert_close(close_d, direction, opens):
+        nonlocal inserted
+        exit_price = close_d["price_sum"] / close_d["qty_sum"]
+        exit_time = datetime.fromtimestamp(close_d["time"] / 1000, tz=timezone.utc).isoformat()
+        qty = close_d["qty"]
+        pnl = close_d["pnl"]
+
+        # 同 symbol + side + close_time 去重
         existing = conn.execute(
-            "SELECT id FROM trades WHERE symbol=? AND ABS(exit_price - ?) < 0.5 AND status='CLOSED'",
-            (symbol, exit_price)
+            "SELECT id FROM trades WHERE symbol=? AND side=? AND close_time=? AND status='CLOSED'",
+            (symbol, direction, exit_time)
         ).fetchone()
         if existing:
-            continue  # 已存在，跳过
+            return
 
-        # 找对应的 BUY（最近的、时间在 sell 之前的）
-        matching_buy = None
-        for buy_oid, buy_d in reversed(buys):
-            if buy_d["time"] < sell_d["time"]:
-                matching_buy = (buy_oid, buy_d)
-                break
-
-        entry_price = None
-        open_time = None
-        qty = sell_d["qty"]
-        if matching_buy:
-            _, buy_d = matching_buy
-            entry_price = buy_d["price_sum"] / buy_d["qty_sum"]
-            open_time = datetime.fromtimestamp(buy_d["time"] / 1000, tz=timezone.utc).isoformat()
+        open_d = find_last_open(opens, close_d["time"])
+        if open_d:
+            entry_price = open_d["price_sum"] / open_d["qty_sum"]
+            open_time = datetime.fromtimestamp(open_d["time"] / 1000, tz=timezone.utc).isoformat()
         else:
-            entry_price = exit_price  # fallback
+            entry_price = exit_price
             open_time = exit_time
 
         conn.execute(
@@ -394,12 +587,17 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
                (open_time, close_time, symbol, side, qty, entry_price, exit_price,
                 leverage, sl_price, tp_price, status, margin_usdt, pnl_usdt)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (open_time, exit_time, symbol, "LONG", qty,
+            (open_time, exit_time, symbol, direction, qty,
              round(entry_price, 4), round(exit_price, 4),
              None, None, None, "CLOSED", None, round(pnl, 6))
         )
         inserted += 1
-        print(f"[sync] 补录: {symbol} {exit_time} entry={entry_price:.2f} exit={exit_price:.2f} pnl={pnl:.4f}")
+        print(f"[sync] 补录: {symbol} {direction} {exit_time} entry={entry_price:.2f} exit={exit_price:.2f} pnl={pnl:.4f}")
+
+    for _, cd in long_closes:
+        insert_close(cd, "LONG", long_opens)
+    for _, cd in short_closes:
+        insert_close(cd, "SHORT", short_opens)
 
     conn.commit()
     conn.close()
@@ -454,6 +652,19 @@ if __name__ == "__main__":
     elif cmd in {"sell", "close"}:
         symbol = sys.argv[2].upper()
         sell(symbol)
+
+    elif cmd == "short":
+        # short SYMBOL USDT_AMOUNT LEVERAGE SL_PCT TP_PCT
+        symbol     = sys.argv[2].upper()
+        usdt_amt   = float(sys.argv[3])
+        leverage   = int(sys.argv[4])
+        sl_pct     = float(sys.argv[5])
+        tp_pct     = float(sys.argv[6])
+        short(symbol, usdt_amt, leverage, sl_pct, tp_pct)
+
+    elif cmd == "cover":
+        symbol = sys.argv[2].upper()
+        cover(symbol)
 
     elif cmd == "status":
         status()
