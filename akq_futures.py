@@ -14,6 +14,10 @@ import json
 import math
 import sqlite3
 from datetime import datetime, timezone
+from urllib.parse import urlencode
+import hmac
+import hashlib
+import requests
 from binance.client import Client
 from binance.enums import *
 
@@ -82,6 +86,23 @@ def round_step(value, step):
 def get_mark_price(symbol):
     r = client.futures_mark_price(symbol=symbol)
     return float(r["markPrice"])
+
+
+def get_futures_algo_open_orders(symbol: str | None = None):
+    """查询 Binance Futures Algo/Conditional 条件单。"""
+    params = {"timestamp": int(datetime.now(timezone.utc).timestamp() * 1000)}
+    if symbol:
+        params["symbol"] = symbol
+    query = urlencode(params)
+    sig = hmac.new(SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    headers = {"X-MBX-APIKEY": KEY}
+    url = f"https://api.binance.com/sapi/v1/algo/futures/openOrders?{query}&signature={sig}"
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict) and data.get("code") not in (None, 0):
+        raise RuntimeError(f"Algo query failed: {data}")
+    return data
 
 # ── 核心函数 ─────────────────────────────────────────────
 def buy(symbol: str, usdt_amount: float, leverage: int,
@@ -274,11 +295,116 @@ def status():
         pnl = float(p["unRealizedProfit"])
         print(f"{p['symbol']}: amt={amt}, entry={p['entryPrice']}, mark={p['markPrice']}, PnL={pnl:.4f}U")
 
-    # 挂单
+    # 普通挂单
     orders = client.futures_get_open_orders()
     print(f"\n=== 挂单 ({len(orders)}个) ===")
     for o in orders:
         print(f"{o['symbol']} {o['type']} {o['side']} stop={o.get('stopPrice','N/A')}")
+
+    # Algo / Conditional 条件单
+    try:
+        algo_orders = get_futures_algo_open_orders()
+    except Exception as e:
+        print(f"\n=== 条件单 (algo) 查询失败 ===")
+        print(str(e))
+    else:
+        if isinstance(algo_orders, dict) and "rows" in algo_orders:
+            rows = algo_orders.get("rows", [])
+        elif isinstance(algo_orders, list):
+            rows = algo_orders
+        else:
+            rows = []
+        print(f"\n=== 条件单 (algo) ({len(rows)}个) ===")
+        for o in rows:
+            print(
+                f"{o.get('symbol')} {o.get('orderType') or o.get('algoType')} {o.get('side')} "
+                f"pos={o.get('positionSide')} qty={o.get('quantity')} trigger={o.get('triggerPrice')} "
+                f"status={o.get('algoStatus')} algoId={o.get('algoId')}"
+            )
+
+
+def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
+    """
+    从 Binance 成交历史补录未入库的平仓记录。
+    匹配逻辑：BUY(开仓) + 对应的 SELL(平仓)，
+    若 DB 里 trades 表中不存在该开仓时间段的 CLOSED 记录，则插入。
+    """
+    raw = client.futures_account_trades(symbol=symbol, limit=limit)
+
+    # 按 orderId 聚合（同一订单可能多笔成交）
+    from collections import defaultdict
+    order_map = defaultdict(lambda: {"side": None, "qty": 0.0, "pnl": 0.0, "price_sum": 0.0, "qty_sum": 0.0, "time": None})
+    for t in raw:
+        oid = t["orderId"]
+        entry = order_map[oid]
+        entry["side"] = t["side"]
+        qty = float(t["qty"])
+        price = float(t["price"])
+        pnl = float(t["realizedPnl"])
+        entry["qty"] += qty
+        entry["pnl"] += pnl
+        entry["price_sum"] += price * qty
+        entry["qty_sum"] += qty
+        if entry["time"] is None:
+            entry["time"] = t["time"]
+
+    # 建立 (BUY, SELL) 配对列表
+    buys = [(oid, d) for oid, d in order_map.items() if d["side"] == "BUY"]
+    sells = [(oid, d) for oid, d in order_map.items() if d["side"] == "SELL"]
+
+    # 按时间排序
+    buys.sort(key=lambda x: x[1]["time"])
+    sells.sort(key=lambda x: x[1]["time"])
+
+    conn = sqlite3.connect(DB_PATH)
+    inserted = 0
+    for sell_oid, sell_d in sells:
+        exit_price = sell_d["price_sum"] / sell_d["qty_sum"]
+        exit_time = datetime.fromtimestamp(sell_d["time"] / 1000, tz=timezone.utc).isoformat()
+        pnl = sell_d["pnl"]
+
+        # 检查 DB 是否已有对应记录（按 exit_price 和 symbol 模糊匹配）
+        existing = conn.execute(
+            "SELECT id FROM trades WHERE symbol=? AND ABS(exit_price - ?) < 0.5 AND status='CLOSED'",
+            (symbol, exit_price)
+        ).fetchone()
+        if existing:
+            continue  # 已存在，跳过
+
+        # 找对应的 BUY（最近的、时间在 sell 之前的）
+        matching_buy = None
+        for buy_oid, buy_d in reversed(buys):
+            if buy_d["time"] < sell_d["time"]:
+                matching_buy = (buy_oid, buy_d)
+                break
+
+        entry_price = None
+        open_time = None
+        qty = sell_d["qty"]
+        if matching_buy:
+            _, buy_d = matching_buy
+            entry_price = buy_d["price_sum"] / buy_d["qty_sum"]
+            open_time = datetime.fromtimestamp(buy_d["time"] / 1000, tz=timezone.utc).isoformat()
+        else:
+            entry_price = exit_price  # fallback
+            open_time = exit_time
+
+        conn.execute(
+            """INSERT INTO trades
+               (open_time, close_time, symbol, side, qty, entry_price, exit_price,
+                leverage, sl_price, tp_price, status, margin_usdt, pnl_usdt)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (open_time, exit_time, symbol, "LONG", qty,
+             round(entry_price, 4), round(exit_price, 4),
+             None, None, None, "CLOSED", None, round(pnl, 6))
+        )
+        inserted += 1
+        print(f"[sync] 补录: {symbol} {exit_time} entry={entry_price:.2f} exit={exit_price:.2f} pnl={pnl:.4f}")
+
+    conn.commit()
+    conn.close()
+    print(f"[sync] 完成，共补录 {inserted} 条")
+    return inserted
 
 
 def snapshot_equity():
@@ -334,6 +460,11 @@ if __name__ == "__main__":
 
     elif cmd == "snapshot":
         snapshot_equity()
+
+    elif cmd == "sync":
+        symbol = sys.argv[2].upper() if len(sys.argv) > 2 else "ETHUSDT"
+        limit = int(sys.argv[3]) if len(sys.argv) > 3 else 50
+        sync_closed_trades(symbol, limit)
 
     else:
         print(f"未知命令: {cmd}")
