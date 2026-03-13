@@ -29,6 +29,7 @@ from flask import Flask, jsonify, request
 DB_PATH = "/home/azureuser/akq-trader/trades.db"
 ENV_PATH = "/home/azureuser/.benv"
 API_TOKEN_PATH = "/home/azureuser/akq-trader/.api_token"
+DASHBOARD_TOKEN_PATH = "/home/azureuser/akq-trader/.dashboard_token"
 AUDIT_LOG_PATH = "/home/azureuser/akq-trader/audit.log"
 WATCHDOG_CONFIG_PATH = "/home/azureuser/akq-trader/watchdog_config.json"
 
@@ -53,7 +54,7 @@ def load_env(path=ENV_PATH):
     return k, s
 
 from binance.client import Client
-from binance.enums import SIDE_SELL, FUTURE_ORDER_TYPE_MARKET
+from binance.enums import SIDE_BUY, SIDE_SELL, FUTURE_ORDER_TYPE_MARKET
 KEY, SECRET = load_env()
 client = Client(KEY, SECRET)
 
@@ -64,7 +65,15 @@ def load_api_token():
     except FileNotFoundError:
         return None
 
+
+def load_dashboard_token():
+    try:
+        return open(DASHBOARD_TOKEN_PATH).read().strip()
+    except FileNotFoundError:
+        return None
+
 API_TOKEN = load_api_token()
+DASHBOARD_TOKEN = load_dashboard_token()
 
 app = Flask(__name__)
 
@@ -119,6 +128,23 @@ def require_auth(f):
             audit_logger.info("AUTH_FAIL | %s %s | ip=%s", request.method, request.path, request.remote_addr)
             return jsonify({"ok": False, "error": "Unauthorized"}), 401
         return f(*args, **kwargs)
+    return decorated
+
+
+def require_dashboard_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # 允许本机调用（dashboard 页面与本地探针）
+        if request.remote_addr in {"127.0.0.1", "::1", "localhost"}:
+            return f(*args, **kwargs)
+
+        token = request.headers.get("X-Dashboard-Token") or request.args.get("token")
+        if DASHBOARD_TOKEN and token == DASHBOARD_TOKEN:
+            return f(*args, **kwargs)
+
+        audit_logger.info("DASHBOARD_AUTH_FAIL | %s %s | ip=%s", request.method, request.path, request.remote_addr)
+        return jsonify({"ok": False, "error": "Dashboard Unauthorized"}), 401
+
     return decorated
 
 # ── helpers ───────────────────────────────────────────────
@@ -338,17 +364,33 @@ def api_trade_close():
         except Exception:
             pass
 
-        # Find position
+        # Find active position (LONG or SHORT)
         positions = client.futures_position_information(symbol=symbol)
-        pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
-        if not pos:
-            pos = next((p for p in positions if float(p["positionAmt"]) > 0), None)
+
+        long_pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
+        short_pos = next((p for p in positions if p.get("positionSide") == "SHORT" and float(p["positionAmt"]) < 0), None)
+
+        # Fallback for one-way mode
+        one_way_pos = None
+        if not long_pos and not short_pos:
+            one_way_pos = next((p for p in positions if float(p["positionAmt"]) != 0), None)
+
+        pos = long_pos or short_pos or one_way_pos
         if not pos:
             audit_logger.info("POST /api/trade/close | ip=%s | %s | no position", request.remote_addr, symbol)
             return jsonify({"ok": False, "error": f"No open position for {symbol}"}), 404
 
-        position_qty = abs(float(pos["positionAmt"]))
+        position_amt = float(pos["positionAmt"])
+        position_qty = abs(position_amt)
         entry_price = float(pos["entryPrice"])
+
+        # Determine direction + close side
+        if pos.get("positionSide") == "SHORT" or position_amt < 0:
+            direction = "SHORT"
+            close_side = SIDE_BUY
+        else:
+            direction = "LONG"
+            close_side = SIDE_SELL
 
         # Determine close quantity
         close_qty = position_qty
@@ -358,10 +400,10 @@ def api_trade_close():
                 return jsonify({"ok": False, "error": f"Invalid qty: {partial_qty} (position has {position_qty})"}), 400
             close_qty = partial_qty
 
-        # Execute market sell
+        # Execute market close
         order_params = {
             "symbol": symbol,
-            "side": SIDE_SELL,
+            "side": close_side,
             "type": FUTURE_ORDER_TYPE_MARKET,
             "quantity": close_qty,
         }
@@ -385,7 +427,10 @@ def api_trade_close():
             mark_data = client.futures_mark_price(symbol=symbol)
             exit_price = float(order.get("avgPrice") or mark_data["markPrice"])
 
-        pnl = (exit_price - entry_price) * close_qty
+        if direction == "SHORT":
+            pnl = (entry_price - exit_price) * close_qty
+        else:
+            pnl = (exit_price - entry_price) * close_qty
 
         # Update DB
         try:
@@ -393,8 +438,8 @@ def api_trade_close():
             if close_qty >= position_qty:
                 # Full close
                 conn.execute(
-                    "UPDATE trades SET close_time=?, exit_price=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
-                    (datetime.now(timezone.utc).isoformat(), exit_price, pnl, symbol)
+                    "UPDATE trades SET close_time=?, exit_price=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND side=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
+                    (datetime.now(timezone.utc).isoformat(), exit_price, pnl, symbol, direction)
                 )
             # Record equity
             balances = client.futures_account_balance()
@@ -409,6 +454,7 @@ def api_trade_close():
 
         result = {
             "symbol": symbol,
+            "direction": direction,
             "qty": close_qty,
             "entryPrice": entry_price,
             "exitPrice": exit_price,
@@ -418,8 +464,8 @@ def api_trade_close():
         }
 
         audit_logger.info(
-            "POST /api/trade/close | ip=%s | %s | qty=%.4f | exit=%.2f | pnl=%.4f",
-            request.remote_addr, symbol, close_qty, exit_price, pnl
+            "POST /api/trade/close | ip=%s | %s | dir=%s | qty=%.4f | exit=%.2f | pnl=%.4f",
+            request.remote_addr, symbol, direction, close_qty, exit_price, pnl
         )
         return jsonify({"ok": True, "data": result})
 
@@ -972,6 +1018,7 @@ def api_watchdog_alerts():
 # DASHBOARD (public, no auth)
 # ═══════════════════════════════════════════════════════════
 @app.route("/dashboard/api/balance")
+@require_dashboard_auth
 def dashboard_balance():
     try:
         balances = client.futures_account_balance()
@@ -989,6 +1036,7 @@ def dashboard_balance():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/dashboard/api/positions")
+@require_dashboard_auth
 def dashboard_positions():
     try:
         positions = client.futures_position_information()
@@ -1021,6 +1069,7 @@ def dashboard_positions():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/dashboard/api/trades")
+@require_dashboard_auth
 def dashboard_trades():
     try:
         conn = get_db()
