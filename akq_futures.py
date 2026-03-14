@@ -8,7 +8,7 @@ AKQ Futures Executor — 真实币安U本位合约交易
   python3 akq_futures.py cover ETHUSDT               # 平空仓
   python3 akq_futures.py status
   python3 akq_futures.py snapshot
-  python3 akq_futures.py manage-long ETHUSDT [TRAIL_GAP_PCT] [force_half]
+  python3 akq_futures.py manage-long ETHUSDT [TRAIL_GAP_PCT] [force_tp1] [fg_now]
   python3 akq_futures.py sync [SYMBOL] [LIMIT]
 """
 
@@ -17,7 +17,7 @@ import re
 import json
 import math
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 import hmac
 import hashlib
@@ -77,8 +77,33 @@ def init_db():
         max_price REAL,
         opened_at TEXT,
         updated_at TEXT,
+        first_tp_taken INTEGER DEFAULT 0,
+        second_tp_taken INTEGER DEFAULT 0,
+        fake_break_count INTEGER DEFAULT 0,
+        touched_2pct INTEGER DEFAULT 0,
+        fg_min_seen REAL,
+        fg_current REAL,
+        timeout_review_due_at TEXT,
+        review_notified INTEGER DEFAULT 0,
         PRIMARY KEY(symbol, side)
     )""")
+
+    # 兼容老库：增量补列
+    cols = {r[1] for r in c.execute("PRAGMA table_info(trade_strategy_state)").fetchall()}
+    add_cols = {
+        "first_tp_taken": "INTEGER DEFAULT 0",
+        "second_tp_taken": "INTEGER DEFAULT 0",
+        "fake_break_count": "INTEGER DEFAULT 0",
+        "touched_2pct": "INTEGER DEFAULT 0",
+        "fg_min_seen": "REAL",
+        "fg_current": "REAL",
+        "timeout_review_due_at": "TEXT",
+        "review_notified": "INTEGER DEFAULT 0",
+    }
+    for col, ddl in add_cols.items():
+        if col not in cols:
+            c.execute(f"ALTER TABLE trade_strategy_state ADD COLUMN {col} {ddl}")
+
     conn.commit()
     conn.close()
 
@@ -109,22 +134,30 @@ def get_mark_price(symbol):
     return float(r["markPrice"])
 
 
-def _upsert_long_strategy_state(symbol: str, entry_price: float, qty: float, trail_gap_pct: float = 1.5):
-    now = datetime.now(timezone.utc).isoformat()
+def _upsert_long_strategy_state(symbol: str, entry_price: float, qty: float, trail_gap_pct: float = 1.5, fg_now: float | None = None):
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    due_iso = (now + timedelta(hours=48)).isoformat()
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
         INSERT INTO trade_strategy_state
           (symbol, side, status, stage, entry_price, qty_initial, qty_remaining,
-           break_even_set, half_taken, trail_gap_pct, max_price, opened_at, updated_at)
-        VALUES (?, 'LONG', 'ACTIVE', 'INIT', ?, ?, ?, 0, 0, ?, ?, ?, ?)
+           break_even_set, half_taken, trail_gap_pct, max_price, opened_at, updated_at,
+           first_tp_taken, second_tp_taken, fake_break_count, touched_2pct,
+           fg_min_seen, fg_current, timeout_review_due_at, review_notified)
+        VALUES (?, 'LONG', 'ACTIVE', 'INIT', ?, ?, ?, 0, 0, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?, 0)
         ON CONFLICT(symbol, side) DO UPDATE SET
           status='ACTIVE', stage='INIT', entry_price=excluded.entry_price,
           qty_initial=excluded.qty_initial, qty_remaining=excluded.qty_remaining,
           break_even_set=0, half_taken=0, trail_gap_pct=excluded.trail_gap_pct,
-          max_price=excluded.max_price, opened_at=excluded.opened_at, updated_at=excluded.updated_at
+          max_price=excluded.max_price, opened_at=excluded.opened_at, updated_at=excluded.updated_at,
+          first_tp_taken=0, second_tp_taken=0, fake_break_count=0, touched_2pct=0,
+          fg_min_seen=excluded.fg_min_seen, fg_current=excluded.fg_current,
+          timeout_review_due_at=excluded.timeout_review_due_at, review_notified=0
         """,
-        (symbol, entry_price, qty, qty, trail_gap_pct, entry_price, now, now)
+        (symbol, entry_price, qty, qty, trail_gap_pct, entry_price, now_iso, now_iso,
+         fg_now, fg_now, due_iso)
     )
     conn.commit()
     conn.close()
@@ -133,7 +166,7 @@ def _upsert_long_strategy_state(symbol: str, entry_price: float, qty: float, tra
 def _load_long_strategy_state(symbol: str):
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT symbol, entry_price, qty_initial, qty_remaining, break_even_set, half_taken, trail_gap_pct, max_price, stage FROM trade_strategy_state WHERE symbol=? AND side='LONG' AND status='ACTIVE'",
+        "SELECT symbol, entry_price, qty_initial, qty_remaining, break_even_set, half_taken, trail_gap_pct, max_price, stage, first_tp_taken, second_tp_taken, fake_break_count, touched_2pct, fg_min_seen, fg_current, timeout_review_due_at, review_notified FROM trade_strategy_state WHERE symbol=? AND side='LONG' AND status='ACTIVE'",
         (symbol,)
     ).fetchone()
     conn.close()
@@ -165,7 +198,7 @@ def _deactivate_long_strategy_state(symbol: str):
     conn.close()
 
 
-def _cancel_open_long_exit_orders(symbol: str, cancel_tp: bool = True, cancel_sl: bool = False):
+def _cancel_open_long_exit_orders(symbol: str, cancel_tp: bool = True, cancel_sl: bool = False, cancel_trailing: bool = False):
     try:
         orders = client.futures_get_open_orders(symbol=symbol)
     except Exception:
@@ -179,6 +212,8 @@ def _cancel_open_long_exit_orders(symbol: str, cancel_tp: bool = True, cancel_sl
         if typ == "TAKE_PROFIT_MARKET" and cancel_tp:
             client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
         if typ == "STOP_MARKET" and cancel_sl:
+            client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
+        if typ == "TRAILING_STOP_MARKET" and cancel_trailing:
             client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
 
 
@@ -201,8 +236,66 @@ def _place_or_replace_long_stop(symbol: str, qty: float, stop_price: float):
     )
 
 
-def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_half: bool = False):
-    """方案C(v1.0)执行器：+2%保本，+4%平半，剩余仓位移动止损。"""
+def _place_or_replace_long_trailing_stop(symbol: str, qty: float, callback_rate_pct: float):
+    info = get_symbol_info(symbol)
+    qty = round_step(qty, info["stepSize"])
+    callback_rate_pct = max(0.1, min(10.0, float(callback_rate_pct)))
+    if qty <= 0:
+        return None
+    _cancel_open_long_exit_orders(symbol, cancel_tp=False, cancel_sl=False, cancel_trailing=True)
+    return client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_SELL,
+        positionSide="LONG",
+        type="TRAILING_STOP_MARKET",
+        quantity=qty,
+        callbackRate=round(callback_rate_pct, 2),
+        reduceOnly=True,
+        workingType="MARK_PRICE",
+    )
+
+
+def _read_fg_now(default=None):
+    paths = [
+        "/home/azureuser/.openclaw/workspace/akq-crypto-trader/tools/fg-monitor/.fg_state.json",
+        "/home/azureuser/akq-crypto-trader/tools/fg-monitor/.fg_state.json",
+    ]
+    for p in paths:
+        try:
+            with open(p, "r") as f:
+                data = json.load(f)
+            for key in ("value", "fg", "fear_greed", "index"):
+                if key in data and data[key] is not None:
+                    return float(data[key])
+        except Exception:
+            continue
+    return default
+
+
+def _compute_trend_ok(symbol: str):
+    kl = client.futures_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=60)
+    closes = [float(k[4]) for k in kl]
+    if len(closes) < 35:
+        return False, {"reason": "kline_insufficient"}
+
+    def ema(vals, n):
+        alpha = 2 / (n + 1)
+        out = vals[0]
+        for v in vals[1:]:
+            out = alpha * v + (1 - alpha) * out
+        return out
+
+    ma7 = sum(closes[-7:]) / 7
+    ma25 = sum(closes[-25:]) / 25
+    ema12 = ema(closes[-35:], 12)
+    ema26 = ema(closes[-35:], 26)
+    macd = ema12 - ema26
+    ok = (ma7 > ma25) and (macd > 0)
+    return ok, {"ma7": ma7, "ma25": ma25, "macd": macd}
+
+
+def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = False, fg_now: float | None = None):
+    """方案C(v1.1)执行器：+1.5%保本，+3%平1/3，+4%再平1/3，余仓trailing；含FG/假突破/48h审查。"""
     positions = client.futures_position_information(symbol=symbol)
     pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
     if not pos:
@@ -216,29 +309,77 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_half: bool = F
     mark = float(pos["markPrice"])
     info = get_symbol_info(symbol)
 
+    if fg_now is None:
+        fg_now = _read_fg_now(default=None)
+
     st = _load_long_strategy_state(symbol)
     if not st:
-        _upsert_long_strategy_state(symbol, entry, qty, trail_gap_pct)
+        _upsert_long_strategy_state(symbol, entry, qty, trail_gap_pct, fg_now=fg_now)
         st = _load_long_strategy_state(symbol)
 
-    _, st_entry, qty_init, qty_rem, be_set, half_taken, gap, max_price, stage = st
+    (_, st_entry, qty_init, qty_rem, be_set, half_taken, gap, max_price, stage,
+     tp1_taken, tp2_taken, fake_break_count, touched_2pct,
+     fg_min_seen, fg_current, timeout_review_due_at, review_notified) = st
+
     gap = float(gap if gap else trail_gap_pct)
     max_price = max(float(max_price if max_price else mark), mark)
 
-    # 进入方案C后，关闭原始整仓 TP，避免与“+4%平半”冲突
-    _cancel_open_long_exit_orders(symbol, cancel_tp=True, cancel_sl=False)
+    # 进入方案C后，关闭原始整仓 TP，避免冲突
+    _cancel_open_long_exit_orders(symbol, cancel_tp=True, cancel_sl=False, cancel_trailing=False)
 
     actions = []
+    alerts = []
     pnl_pct = (mark - st_entry) / st_entry * 100 if st_entry else 0.0
 
-    if (not be_set) and pnl_pct >= 2.0:
+    # FG 极端反转：<20 -> >50 立即平仓
+    if fg_now is not None:
+        if fg_min_seen is None:
+            fg_min_seen = fg_now
+        fg_min_seen = min(float(fg_min_seen), float(fg_now))
+        fg_current = float(fg_now)
+        if fg_min_seen < 20 and fg_current > 50:
+            actions.append("fg_extreme_reversal_close")
+            sell(symbol)
+            out = {
+                "status": "closed_by_fg_reversal",
+                "symbol": symbol,
+                "fg_min_seen": fg_min_seen,
+                "fg_now": fg_current,
+                "actions": actions,
+            }
+            print(json.dumps(out, indent=2))
+            return out
+
+    # 假突破计数：触及+2%后回落到成本（<=0.1%）计数；2次强平
+    if pnl_pct >= 2.0:
+        touched_2pct = 1
+    if touched_2pct and pnl_pct <= 0.1:
+        fake_break_count = int(fake_break_count or 0) + 1
+        touched_2pct = 0
+        actions.append(f"fake_break_count:{fake_break_count}")
+        if fake_break_count >= 2:
+            actions.append("force_close_fake_break_x2")
+            sell(symbol)
+            out = {
+                "status": "closed_by_fake_breakout",
+                "symbol": symbol,
+                "fake_break_count": fake_break_count,
+                "actions": actions,
+            }
+            print(json.dumps(out, indent=2))
+            return out
+
+    # +1.5% 移到保本
+    if (not be_set) and pnl_pct >= 1.5:
         _place_or_replace_long_stop(symbol, qty, st_entry)
         be_set = 1
         stage = "BREAKEVEN"
         actions.append("move_sl_to_breakeven")
 
-    if (not half_taken) and (pnl_pct >= 4.0 or force_half):
-        close_qty = round_step(max(qty * 0.5, info["stepSize"]), info["stepSize"])
+    # +3% 平1/3
+    if (not tp1_taken) and (pnl_pct >= 3.0 or force_tp1):
+        close_qty = round_step(max(qty_init / 3.0, info["stepSize"]), info["stepSize"])
+        close_qty = min(close_qty, qty)
         if close_qty > 0 and close_qty < qty:
             client.futures_create_order(
                 symbol=symbol,
@@ -248,19 +389,67 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_half: bool = F
                 quantity=close_qty,
                 reduceOnly=True,
             )
-            actions.append(f"take_profit_half:{close_qty}")
-        # refresh position
+            actions.append(f"take_profit_1_3_at_3pct:{close_qty}")
         positions = client.futures_position_information(symbol=symbol)
         pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
         qty = abs(float(pos["positionAmt"])) if pos else 0.0
+        tp1_taken = 1
         half_taken = 1
-        stage = "HALF_TAKEN"
+        stage = "TP1_TAKEN"
 
-    if half_taken and qty > 0:
+    # +4% 再平1/3
+    if tp1_taken and (not tp2_taken) and pnl_pct >= 4.0 and qty > 0:
+        close_qty = round_step(max(qty_init / 3.0, info["stepSize"]), info["stepSize"])
+        close_qty = min(close_qty, qty)
+        if close_qty > 0 and close_qty < qty:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                positionSide="LONG",
+                type=FUTURE_ORDER_TYPE_MARKET,
+                quantity=close_qty,
+                reduceOnly=True,
+            )
+            actions.append(f"take_profit_1_3_at_4pct:{close_qty}")
+        positions = client.futures_position_information(symbol=symbol)
+        pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
+        qty = abs(float(pos["positionAmt"])) if pos else 0.0
+        tp2_taken = 1
+        stage = "TP2_TAKEN"
+
+    # 余仓 trailing（策略层 + 交易所 TRAILING_STOP_MARKET 兜底）
+    if tp2_taken and qty > 0:
         trail_stop = max(st_entry, max_price * (1 - gap / 100))
-        _place_or_replace_long_stop(symbol, qty, trail_stop)
+        _place_or_replace_long_stop(symbol, qty, trail_stop)  # 策略层硬止损
+        try:
+            _place_or_replace_long_trailing_stop(symbol, qty, gap)  # 交易所 trailing 兜底
+            actions.append(f"exchange_trailing_stop:{gap}%")
+        except Exception as e:
+            alerts.append(f"trailing_stop_failed:{e}")
         actions.append(f"trail_sl:{round(trail_stop,4)}")
         stage = "TRAILING"
+
+    # 48h 审查事件（不自动平仓）
+    if timeout_review_due_at:
+        try:
+            due_dt = datetime.fromisoformat(timeout_review_due_at)
+            now_dt = datetime.now(timezone.utc)
+            if now_dt >= due_dt and not review_notified:
+                trend_ok, trend_meta = _compute_trend_ok(symbol)
+                recommendation = "close"
+                if pnl_pct > 3 and trend_ok:
+                    recommendation = "extend_24h"
+                elif pnl_pct < 0:
+                    recommendation = "close_now"
+                alerts.append(
+                    f"REVIEW_REQUIRED_48H symbol={symbol} pnl_pct={round(pnl_pct,3)} recommendation={recommendation} trend={json.dumps(trend_meta)}"
+                )
+                review_notified = 1
+                if recommendation == "extend_24h":
+                    timeout_review_due_at = (now_dt + timedelta(hours=24)).isoformat()
+                    review_notified = 0
+        except Exception as e:
+            alerts.append(f"review_check_error:{e}")
 
     _save_long_strategy_state(
         symbol,
@@ -270,6 +459,14 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_half: bool = F
         trail_gap_pct=gap,
         max_price=max_price,
         stage=stage,
+        first_tp_taken=tp1_taken,
+        second_tp_taken=tp2_taken,
+        fake_break_count=fake_break_count,
+        touched_2pct=touched_2pct,
+        fg_min_seen=fg_min_seen,
+        fg_current=fg_current,
+        timeout_review_due_at=timeout_review_due_at,
+        review_notified=review_notified,
     )
 
     out = {
@@ -281,7 +478,10 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_half: bool = F
         "qty_remaining": round(qty, 6),
         "stage": stage,
         "trail_gap_pct": gap,
+        "fake_break_count": int(fake_break_count or 0),
+        "fg_now": fg_now,
         "actions": actions,
+        "alerts": alerts,
     }
     print(json.dumps(out, indent=2))
     return out
@@ -394,7 +594,7 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
         )
         conn.commit()
         conn.close()
-        _upsert_long_strategy_state(symbol, entry_price, qty, trail_gap_pct=1.5)
+        _upsert_long_strategy_state(symbol, entry_price, qty, trail_gap_pct=1.5, fg_now=_read_fg_now(default=None))
     except Exception as e:
         print(f"[DB] 写入失败: {e}")
 
@@ -906,8 +1106,9 @@ if __name__ == "__main__":
     elif cmd == "manage-long":
         symbol = sys.argv[2].upper()
         gap = float(sys.argv[3]) if len(sys.argv) > 3 else 1.5
-        force_half = (len(sys.argv) > 4 and sys.argv[4].lower() in {"1", "true", "yes", "force", "force_half"})
-        manage_long_tp(symbol, trail_gap_pct=gap, force_half=force_half)
+        force_tp1 = (len(sys.argv) > 4 and sys.argv[4].lower() in {"1", "true", "yes", "force", "force_tp1"})
+        fg_now = float(sys.argv[5]) if len(sys.argv) > 5 else None
+        manage_long_tp(symbol, trail_gap_pct=gap, force_tp1=force_tp1, fg_now=fg_now)
 
     elif cmd == "sync":
         symbol = sys.argv[2].upper() if len(sys.argv) > 2 else "ETHUSDT"
