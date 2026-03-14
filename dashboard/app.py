@@ -1161,13 +1161,23 @@ const $=s=>document.getElementById(s);
 const fmt=(v,d=2)=>v!=null?Number(v).toFixed(d):'-';
 const cls=v=>v>=0?'pos':'neg';
 const INITIAL_CAPITAL_USDT = 147.20; // Kingo 入金本金，可按需调整
+const DASH_TOKEN = new URLSearchParams(window.location.search).get('token');
 
 function updateLastRefresh(){
   const ts=new Date().toLocaleString('en-GB',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
   $('last-refresh').textContent=`Last refresh: ${ts}`;
 }
 
-async function fetchJSON(url){try{const r=await fetch(url);return await r.json();}catch(e){return{error:e.message};}}
+async function fetchJSON(url){
+  try{
+    let finalUrl=url;
+    if(DASH_TOKEN){
+      finalUrl += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(DASH_TOKEN);
+    }
+    const r=await fetch(finalUrl);
+    return await r.json();
+  }catch(e){return{error:e.message};}
+}
 
 async function loadBalance(){
   const d=await fetchJSON('/dashboard/api/balance');
