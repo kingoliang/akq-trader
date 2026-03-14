@@ -136,16 +136,8 @@ def require_auth(f):
 def require_dashboard_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # 允许本机调用（dashboard 页面与本地探针）
-        if request.remote_addr in {"127.0.0.1", "::1", "localhost"}:
-            return f(*args, **kwargs)
-
-        token = request.headers.get("X-Dashboard-Token") or request.args.get("token")
-        if DASHBOARD_TOKEN and token == DASHBOARD_TOKEN:
-            return f(*args, **kwargs)
-
-        audit_logger.info("DASHBOARD_AUTH_FAIL | %s %s | ip=%s", request.method, request.path, request.remote_addr)
-        return jsonify({"ok": False, "error": "Dashboard Unauthorized"}), 401
+        # Kingo 要求：Dashboard 只在 Tailscale 内网使用，不做 token 鉴权
+        return f(*args, **kwargs)
 
     return decorated
 
