@@ -301,7 +301,7 @@ def api_orders():
 def api_trades():
     try:
         conn = get_db()
-        rows = conn.execute("SELECT * FROM trades ORDER BY COALESCE(close_time, open_time) DESC, id DESC LIMIT 100").fetchall()
+        rows = conn.execute("SELECT * FROM trades ORDER BY open_time DESC, id DESC LIMIT 100").fetchall()
         conn.close()
         audit_logger.info("GET /api/trades | ip=%s | count=%d", request.remote_addr, len(rows))
         return jsonify({"ok": True, "data": [dict(r) for r in rows]})
@@ -1071,7 +1071,7 @@ def dashboard_positions():
 def dashboard_trades():
     try:
         conn = get_db()
-        rows = conn.execute("SELECT * FROM trades ORDER BY COALESCE(close_time, open_time) DESC, id DESC LIMIT 100").fetchall()
+        rows = conn.execute("SELECT * FROM trades ORDER BY open_time DESC, id DESC LIMIT 100").fetchall()
         conn.close()
         return jsonify([dict(r) for r in rows])
     except Exception as e:
