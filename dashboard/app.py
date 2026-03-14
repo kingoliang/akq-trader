@@ -1224,7 +1224,7 @@ async function loadTrades(){
   const closed=d.filter(t=>t.status==='CLOSED');
   const totalFee=closed.reduce((s,t)=>s+((t.fee_usdt||0)),0);
   const totalGross=closed.reduce((s,t)=>s+((t.gross_pnl_usdt||t.pnl_usdt||0)),0);
-  const totalPnl=closed.reduce((s,t)=>s+((t.net_pnl_usdt??t.pnl_usdt||0)),0);
+  const totalPnl=closed.reduce((s,t)=>s+(((t.net_pnl_usdt ?? t.pnl_usdt) || 0)),0);
   const roiPct=INITIAL_CAPITAL_USDT>0?(totalPnl/INITIAL_CAPITAL_USDT*100):0;
   const roiText=`${totalPnl>=0?'+':''}${fmt(roiPct,2)}%`;
   const wins=closed.filter(t=>(t.pnl_usdt||0)>0).length;
