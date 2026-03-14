@@ -566,14 +566,6 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
         qty = close_d["qty"]
         pnl = close_d["pnl"]
 
-        # 同 symbol + side + close_time 去重
-        existing = conn.execute(
-            "SELECT id FROM trades WHERE symbol=? AND side=? AND close_time=? AND status='CLOSED'",
-            (symbol, direction, exit_time)
-        ).fetchone()
-        if existing:
-            return
-
         open_d = find_last_open(opens, close_d["time"])
         if open_d:
             entry_price = open_d["price_sum"] / open_d["qty_sum"]
@@ -581,6 +573,34 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
         else:
             entry_price = exit_price
             open_time = exit_time
+
+        # 去重（增强版）：
+        # 1) 精确去重：symbol + side + close_time
+        existing = conn.execute(
+            "SELECT id FROM trades WHERE symbol=? AND side=? AND close_time=? AND status='CLOSED'",
+            (symbol, direction, exit_time)
+        ).fetchone()
+        if existing:
+            return
+
+        # 2) 近似去重：防止同一笔被“实时写入 + sync补录”重复记录
+        #    条件：同 symbol/side，且 qty/entry/exit/pnl 基本一致，开平仓时间在 ±120 秒内
+        fuzzy_existing = conn.execute(
+            """
+            SELECT id FROM trades
+            WHERE symbol=? AND side=? AND status='CLOSED'
+              AND ABS(COALESCE(qty,0) - ?) < 1e-6
+              AND ABS(COALESCE(entry_price,0) - ?) < 0.02
+              AND ABS(COALESCE(exit_price,0) - ?) < 0.02
+              AND ABS(COALESCE(pnl_usdt,0) - ?) < 0.02
+              AND ABS(strftime('%s', close_time) - strftime('%s', ?)) <= 120
+              AND ABS(strftime('%s', open_time) - strftime('%s', ?)) <= 120
+            LIMIT 1
+            """,
+            (symbol, direction, qty, round(entry_price, 4), round(exit_price, 4), round(pnl, 6), exit_time, open_time)
+        ).fetchone()
+        if fuzzy_existing:
+            return
 
         conn.execute(
             """INSERT INTO trades
