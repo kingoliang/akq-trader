@@ -25,6 +25,7 @@ from binance.client import Client
 from binance.enums import *
 
 DB_PATH = "/home/azureuser/akq-trader/trades.db"
+TAKER_FEE_RATE = 0.0004  # 0.04% each side
 
 # ── 加载 API Key ─────────────────────────────────────────
 def load_env(path="/home/azureuser/.benv"):
@@ -205,6 +206,14 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
     return result
 
 
+def _net_pnl_after_taker_fee(entry_price: float, exit_price: float, qty: float, side: str):
+    """返回 (gross_pnl, fee_usdt, net_pnl)，手续费按开平双边 0.04% 估算。"""
+    gross = (exit_price - entry_price) * qty if side == "LONG" else (entry_price - exit_price) * qty
+    fee = (entry_price * qty + exit_price * qty) * TAKER_FEE_RATE
+    net = gross - fee
+    return gross, fee, net
+
+
 def sell(symbol: str) -> dict:
     """市价平掉 symbol 的 LONG 仓位；兼容 hedge mode。"""
     # 取消所有挂单
@@ -248,7 +257,7 @@ def sell(symbol: str) -> dict:
     if exit_price is None:
         exit_price = float(order.get("avgPrice") or get_mark_price(symbol))
 
-    pnl = (exit_price - entry_price) * qty
+    gross_pnl, fee_usdt, pnl = _net_pnl_after_taker_fee(entry_price, exit_price, qty, "LONG")
 
     # 更新交易记录 + 记录权益曲线
     try:
@@ -273,6 +282,8 @@ def sell(symbol: str) -> dict:
         "symbol": symbol,
         "qty": qty,
         "exit_price": exit_price,
+        "gross_pnl_usdt": round(gross_pnl, 4),
+        "fee_usdt": round(fee_usdt, 4),
         "pnl_usdt": round(pnl, 4),
         "order_id": order["orderId"],
     }
@@ -458,8 +469,8 @@ def cover(symbol: str) -> dict:
     if exit_price is None:
         exit_price = float(order.get("avgPrice") or get_mark_price(symbol))
 
-    # 做空盈亏：入场价 - 平仓价（价格下跌=盈利）
-    pnl = (entry_price - exit_price) * qty
+    # 做空净盈亏：毛利 - 开平双边 taker 手续费
+    gross_pnl, fee_usdt, pnl = _net_pnl_after_taker_fee(entry_price, exit_price, qty, "SHORT")
 
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -483,6 +494,8 @@ def cover(symbol: str) -> dict:
         "direction": "SHORT",
         "qty": qty,
         "exit_price": exit_price,
+        "gross_pnl_usdt": round(gross_pnl, 4),
+        "fee_usdt": round(fee_usdt, 4),
         "pnl_usdt": round(pnl, 4),
         "order_id": order["orderId"],
     }
