@@ -1160,6 +1160,7 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
 const $=s=>document.getElementById(s);
 const fmt=(v,d=2)=>v!=null?Number(v).toFixed(d):'-';
 const cls=v=>v>=0?'pos':'neg';
+const INITIAL_CAPITAL_USDT = 147.20; // Kingo 入金本金，可按需调整
 
 function updateLastRefresh(){
   const ts=new Date().toLocaleString('en-GB',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
@@ -1197,11 +1198,13 @@ async function loadTrades(){
   if(d.error){$('stats').innerHTML='<span class="neg">Error</span>';$('trades').innerHTML='<tr><td colspan="9" class="neg">Error</td></tr>';return;}
   const closed=d.filter(t=>t.status==='CLOSED');
   const totalPnl=closed.reduce((s,t)=>s+(t.pnl_usdt||0),0);
+  const roiPct=INITIAL_CAPITAL_USDT>0?(totalPnl/INITIAL_CAPITAL_USDT*100):0;
+  const roiText=`${totalPnl>=0?'+':''}${fmt(roiPct,2)}%`;
   const wins=closed.filter(t=>(t.pnl_usdt||0)>0).length;
   const winRate=closed.length?(wins/closed.length*100):0;
   $('stats').innerHTML=`
     <div class="stat-item"><div class="val">${d.length}</div><div class="lbl">Total Trades</div></div>
-    <div class="stat-item"><div class="val ${cls(totalPnl)}">${fmt(totalPnl)}</div><div class="lbl">Total PnL</div></div>
+    <div class="stat-item"><div class="val ${cls(totalPnl)}">${fmt(totalPnl)} (${roiText})</div><div class="lbl">Total PnL / ROI</div></div>
     <div class="stat-item"><div class="val">${fmt(winRate,1)}%</div><div class="lbl">Win Rate</div></div>
     <div class="stat-item"><div class="val">${closed.length}</div><div class="lbl">Closed</div></div>`;
   if(!d.length){$('trades').innerHTML='<tr><td colspan="9" style="color:#484f58">No trades yet</td></tr>';return;}
