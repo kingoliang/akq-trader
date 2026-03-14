@@ -1151,8 +1151,8 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
 <div class="card">
   <h2>Trade History</h2>
   <table>
-    <thead><tr><th>Open Time</th><th>Close Time</th><th>Symbol</th><th>Qty</th><th>Entry</th><th>Exit</th><th>PnL (USDT)</th><th>Status</th></tr></thead>
-    <tbody id="trades"><tr><td colspan="8" class="loader">Loading...</td></tr></tbody>
+    <thead><tr><th>Open Time</th><th>Close Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>PnL (USDT)</th><th>Status</th></tr></thead>
+    <tbody id="trades"><tr><td colspan="9" class="loader">Loading...</td></tr></tbody>
   </table>
 </div>
 
@@ -1194,7 +1194,7 @@ async function loadPositions(){
 
 async function loadTrades(){
   const d=await fetchJSON('/dashboard/api/trades');
-  if(d.error){$('stats').innerHTML='<span class="neg">Error</span>';$('trades').innerHTML='<tr><td colspan="7" class="neg">Error</td></tr>';return;}
+  if(d.error){$('stats').innerHTML='<span class="neg">Error</span>';$('trades').innerHTML='<tr><td colspan="9" class="neg">Error</td></tr>';return;}
   const closed=d.filter(t=>t.status==='CLOSED');
   const totalPnl=closed.reduce((s,t)=>s+(t.pnl_usdt||0),0);
   const wins=closed.filter(t=>(t.pnl_usdt||0)>0).length;
@@ -1204,11 +1204,14 @@ async function loadTrades(){
     <div class="stat-item"><div class="val ${cls(totalPnl)}">${fmt(totalPnl)}</div><div class="lbl">Total PnL</div></div>
     <div class="stat-item"><div class="val">${fmt(winRate,1)}%</div><div class="lbl">Win Rate</div></div>
     <div class="stat-item"><div class="val">${closed.length}</div><div class="lbl">Closed</div></div>`;
-  if(!d.length){$('trades').innerHTML='<tr><td colspan="8" style="color:#484f58">No trades yet</td></tr>';return;}
+  if(!d.length){$('trades').innerHTML='<tr><td colspan="9" style="color:#484f58">No trades yet</td></tr>';return;}
   $('trades').innerHTML=d.map(t=>`<tr>
     <td>${t.open_time?t.open_time.replace('T',' ').slice(0,19):'-'}</td>
     <td>${t.close_time?t.close_time.replace('T',' ').slice(0,19):'-'}</td>
-    <td>${t.symbol}</td><td>${t.qty!=null?fmt(t.qty,4):'-'}</td><td>${fmt(t.entry_price,4)}</td>
+    <td>${t.symbol}</td>
+    <td>${t.side||'-'}</td>
+    <td>${t.qty!=null?fmt(t.qty,4):'-'}</td>
+    <td>${fmt(t.entry_price,4)}</td>
     <td>${t.exit_price?fmt(t.exit_price,4):'-'}</td>
     <td class="${cls(t.pnl_usdt)}">${t.pnl_usdt!=null?fmt(t.pnl_usdt):'-'}</td>
     <td>${t.status}</td></tr>`).join('');
