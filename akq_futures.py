@@ -995,7 +995,8 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
             return
 
         # 2) 近似去重：防止同一笔被“实时写入 + sync补录”重复记录
-        #    条件：同 symbol/side，且 qty/entry/exit/pnl 基本一致，开平仓时间在 ±120 秒内
+        #    注意：pnl_usdt 可能因手续费口径不同而有差异，不能作为去重条件
+        #    条件：同 symbol/side + qty/entry/exit 基本一致，开平仓时间在 ±180 秒内
         fuzzy_existing = conn.execute(
             """
             SELECT id FROM trades
@@ -1003,12 +1004,11 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
               AND ABS(COALESCE(qty,0) - ?) < 1e-6
               AND ABS(COALESCE(entry_price,0) - ?) < 0.02
               AND ABS(COALESCE(exit_price,0) - ?) < 0.02
-              AND ABS(COALESCE(pnl_usdt,0) - ?) < 0.02
-              AND ABS(strftime('%s', close_time) - strftime('%s', ?)) <= 120
-              AND ABS(strftime('%s', open_time) - strftime('%s', ?)) <= 120
+              AND ABS(strftime('%s', close_time) - strftime('%s', ?)) <= 180
+              AND ABS(strftime('%s', open_time) - strftime('%s', ?)) <= 180
             LIMIT 1
             """,
-            (symbol, direction, qty, round(entry_price, 4), round(exit_price, 4), round(pnl, 6), exit_time, open_time)
+            (symbol, direction, qty, round(entry_price, 4), round(exit_price, 4), exit_time, open_time)
         ).fetchone()
         if fuzzy_existing:
             return
