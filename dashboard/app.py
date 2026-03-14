@@ -570,7 +570,6 @@ def _open_position(symbol, usdt_amount, leverage, sl_pct, tp_pct, side, task_id=
         type="STOP_MARKET",
         quantity=qty,
         stopPrice=sl_price,
-        reduceOnly=True,
         timeInForce="GTE_GTC",
     )
 
@@ -592,7 +591,6 @@ def _open_position(symbol, usdt_amount, leverage, sl_pct, tp_pct, side, task_id=
             type="TAKE_PROFIT_MARKET",
             quantity=qty,
             stopPrice=tp_price,
-            reduceOnly=True,
             timeInForce="GTE_GTC",
         )
         tp_order_id = tp_order.get("orderId")
