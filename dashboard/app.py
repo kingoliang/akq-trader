@@ -80,6 +80,8 @@ app = Flask(__name__)
 # ═══════════════════════════════════════════════════════════
 # POSITION LIMITS (percentage-based)
 # ═══════════════════════════════════════════════════════════
+TAKER_FEE_RATE = 0.0004  # 0.04% each side
+
 LIMITS = {
     "steady_first_pct": 40,     # 稳健仓第一仓 ≤ 权益×40%
     "steady_add_pct": 27,       # 稳健仓加仓 ≤ 权益×27%
@@ -187,6 +189,16 @@ def init_db():
         created_at TEXT,
         result_json TEXT
     )""")
+
+    # schema migration for fee-aware pnl
+    cols = {r[1] for r in c.execute("PRAGMA table_info(trades)").fetchall()}
+    if "gross_pnl_usdt" not in cols:
+        c.execute("ALTER TABLE trades ADD COLUMN gross_pnl_usdt REAL")
+    if "fee_usdt" not in cols:
+        c.execute("ALTER TABLE trades ADD COLUMN fee_usdt REAL")
+    if "net_pnl_usdt" not in cols:
+        c.execute("ALTER TABLE trades ADD COLUMN net_pnl_usdt REAL")
+
     conn.commit()
     conn.close()
 
@@ -428,9 +440,11 @@ def api_trade_close():
             exit_price = float(order.get("avgPrice") or mark_data["markPrice"])
 
         if direction == "SHORT":
-            pnl = (entry_price - exit_price) * close_qty
+            gross_pnl = (entry_price - exit_price) * close_qty
         else:
-            pnl = (exit_price - entry_price) * close_qty
+            gross_pnl = (exit_price - entry_price) * close_qty
+        fee_usdt = (entry_price * close_qty + exit_price * close_qty) * TAKER_FEE_RATE
+        pnl = gross_pnl - fee_usdt
 
         # Update DB
         try:
@@ -438,8 +452,8 @@ def api_trade_close():
             if close_qty >= position_qty:
                 # Full close
                 conn.execute(
-                    "UPDATE trades SET close_time=?, exit_price=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND side=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
-                    (datetime.now(timezone.utc).isoformat(), exit_price, pnl, symbol, direction)
+                    "UPDATE trades SET close_time=?, exit_price=?, gross_pnl_usdt=?, fee_usdt=?, net_pnl_usdt=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND side=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
+                    (datetime.now(timezone.utc).isoformat(), exit_price, gross_pnl, fee_usdt, pnl, pnl, symbol, direction)
                 )
             # Record equity
             balances = client.futures_account_balance()
@@ -458,14 +472,17 @@ def api_trade_close():
             "qty": close_qty,
             "entryPrice": entry_price,
             "exitPrice": exit_price,
+            "grossPnlUsdt": round(gross_pnl, 4),
+            "feeUsdt": round(fee_usdt, 4),
+            "netPnlUsdt": round(pnl, 4),
             "pnlUsdt": round(pnl, 4),
             "orderId": order["orderId"],
             "partial": close_qty < position_qty,
         }
 
         audit_logger.info(
-            "POST /api/trade/close | ip=%s | %s | dir=%s | qty=%.4f | exit=%.2f | pnl=%.4f",
-            request.remote_addr, symbol, direction, close_qty, exit_price, pnl
+            "POST /api/trade/close | ip=%s | %s | dir=%s | qty=%.4f | exit=%.2f | gross=%.4f | fee=%.4f | net=%.4f",
+            request.remote_addr, symbol, direction, close_qty, exit_price, gross_pnl, fee_usdt, pnl
         )
         return jsonify({"ok": True, "data": result})
 
@@ -1149,8 +1166,8 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
 <div class="card">
   <h2>Trade History</h2>
   <table>
-    <thead><tr><th>Open Time</th><th>Close Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>PnL (USDT)</th><th>Status</th></tr></thead>
-    <tbody id="trades"><tr><td colspan="9" class="loader">Loading...</td></tr></tbody>
+    <thead><tr><th>Open Time</th><th>Close Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Gross</th><th>Fee</th><th>Net PnL</th><th>Status</th></tr></thead>
+    <tbody id="trades"><tr><td colspan="11" class="loader">Loading...</td></tr></tbody>
   </table>
 </div>
 
@@ -1203,19 +1220,23 @@ async function loadPositions(){
 
 async function loadTrades(){
   const d=await fetchJSON('/dashboard/api/trades');
-  if(d.error){$('stats').innerHTML='<span class="neg">Error</span>';$('trades').innerHTML='<tr><td colspan="9" class="neg">Error</td></tr>';return;}
+  if(d.error){$('stats').innerHTML='<span class="neg">Error</span>';$('trades').innerHTML='<tr><td colspan="11" class="neg">Error</td></tr>';return;}
   const closed=d.filter(t=>t.status==='CLOSED');
-  const totalPnl=closed.reduce((s,t)=>s+(t.pnl_usdt||0),0);
+  const totalFee=closed.reduce((s,t)=>s+((t.fee_usdt||0)),0);
+  const totalGross=closed.reduce((s,t)=>s+((t.gross_pnl_usdt||t.pnl_usdt||0)),0);
+  const totalPnl=closed.reduce((s,t)=>s+((t.net_pnl_usdt??t.pnl_usdt||0)),0);
   const roiPct=INITIAL_CAPITAL_USDT>0?(totalPnl/INITIAL_CAPITAL_USDT*100):0;
   const roiText=`${totalPnl>=0?'+':''}${fmt(roiPct,2)}%`;
   const wins=closed.filter(t=>(t.pnl_usdt||0)>0).length;
   const winRate=closed.length?(wins/closed.length*100):0;
   $('stats').innerHTML=`
     <div class="stat-item"><div class="val">${d.length}</div><div class="lbl">Total Trades</div></div>
-    <div class="stat-item"><div class="val ${cls(totalPnl)}">${fmt(totalPnl)} (${roiText})</div><div class="lbl">Total PnL / ROI</div></div>
+    <div class="stat-item"><div class="val ${cls(totalPnl)}">${fmt(totalPnl)} (${roiText})</div><div class="lbl">Total Net PnL / ROI</div></div>
+    <div class="stat-item"><div class="val">${fmt(totalGross)}</div><div class="lbl">Total Gross PnL</div></div>
+    <div class="stat-item"><div class="val neg">${fmt(totalFee)}</div><div class="lbl">Total Fees</div></div>
     <div class="stat-item"><div class="val">${fmt(winRate,1)}%</div><div class="lbl">Win Rate</div></div>
     <div class="stat-item"><div class="val">${closed.length}</div><div class="lbl">Closed</div></div>`;
-  if(!d.length){$('trades').innerHTML='<tr><td colspan="9" style="color:#484f58">No trades yet</td></tr>';return;}
+  if(!d.length){$('trades').innerHTML='<tr><td colspan="11" style="color:#484f58">No trades yet</td></tr>';return;}
   $('trades').innerHTML=d.map(t=>`<tr>
     <td>${t.open_time?t.open_time.replace('T',' ').slice(0,19):'-'}</td>
     <td>${t.close_time?t.close_time.replace('T',' ').slice(0,19):'-'}</td>
@@ -1224,7 +1245,9 @@ async function loadTrades(){
     <td>${t.qty!=null?fmt(t.qty,4):'-'}</td>
     <td>${fmt(t.entry_price,4)}</td>
     <td>${t.exit_price?fmt(t.exit_price,4):'-'}</td>
-    <td class="${cls(t.pnl_usdt)}">${t.pnl_usdt!=null?fmt(t.pnl_usdt):'-'}</td>
+    <td class="${cls(t.gross_pnl_usdt??t.pnl_usdt)}">${(t.gross_pnl_usdt??t.pnl_usdt)!=null?fmt((t.gross_pnl_usdt??t.pnl_usdt)):'-'}</td>
+    <td class="neg">${t.fee_usdt!=null?fmt(t.fee_usdt):'-'}</td>
+    <td class="${cls(t.net_pnl_usdt??t.pnl_usdt)}">${(t.net_pnl_usdt??t.pnl_usdt)!=null?fmt((t.net_pnl_usdt??t.pnl_usdt)):'-'}</td>
     <td>${t.status}</td></tr>`).join('');
 }
 
