@@ -8,6 +8,7 @@ AKQ Futures Executor — 真实币安U本位合约交易
   python3 akq_futures.py cover ETHUSDT               # 平空仓
   python3 akq_futures.py status
   python3 akq_futures.py snapshot
+  python3 akq_futures.py manage-long ETHUSDT [TRAIL_GAP_PCT] [force_half]
   python3 akq_futures.py sync [SYMBOL] [LIMIT]
 """
 
@@ -62,6 +63,22 @@ def init_db():
         time TEXT,
         equity REAL
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS trade_strategy_state (
+        symbol TEXT,
+        side TEXT,
+        status TEXT DEFAULT 'ACTIVE',
+        stage TEXT DEFAULT 'INIT',
+        entry_price REAL,
+        qty_initial REAL,
+        qty_remaining REAL,
+        break_even_set INTEGER DEFAULT 0,
+        half_taken INTEGER DEFAULT 0,
+        trail_gap_pct REAL DEFAULT 1.5,
+        max_price REAL,
+        opened_at TEXT,
+        updated_at TEXT,
+        PRIMARY KEY(symbol, side)
+    )""")
     conn.commit()
     conn.close()
 
@@ -90,6 +107,184 @@ def round_step(value, step):
 def get_mark_price(symbol):
     r = client.futures_mark_price(symbol=symbol)
     return float(r["markPrice"])
+
+
+def _upsert_long_strategy_state(symbol: str, entry_price: float, qty: float, trail_gap_pct: float = 1.5):
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO trade_strategy_state
+          (symbol, side, status, stage, entry_price, qty_initial, qty_remaining,
+           break_even_set, half_taken, trail_gap_pct, max_price, opened_at, updated_at)
+        VALUES (?, 'LONG', 'ACTIVE', 'INIT', ?, ?, ?, 0, 0, ?, ?, ?, ?)
+        ON CONFLICT(symbol, side) DO UPDATE SET
+          status='ACTIVE', stage='INIT', entry_price=excluded.entry_price,
+          qty_initial=excluded.qty_initial, qty_remaining=excluded.qty_remaining,
+          break_even_set=0, half_taken=0, trail_gap_pct=excluded.trail_gap_pct,
+          max_price=excluded.max_price, opened_at=excluded.opened_at, updated_at=excluded.updated_at
+        """,
+        (symbol, entry_price, qty, qty, trail_gap_pct, entry_price, now, now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def _load_long_strategy_state(symbol: str):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT symbol, entry_price, qty_initial, qty_remaining, break_even_set, half_taken, trail_gap_pct, max_price, stage FROM trade_strategy_state WHERE symbol=? AND side='LONG' AND status='ACTIVE'",
+        (symbol,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def _save_long_strategy_state(symbol: str, **kwargs):
+    if not kwargs:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    fields = []
+    vals = []
+    for k, v in kwargs.items():
+        fields.append(f"{k}=?")
+        vals.append(v)
+    fields.append("updated_at=?")
+    vals.append(now)
+    vals.append(symbol)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(f"UPDATE trade_strategy_state SET {', '.join(fields)} WHERE symbol=? AND side='LONG'", vals)
+    conn.commit()
+    conn.close()
+
+
+def _deactivate_long_strategy_state(symbol: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE trade_strategy_state SET status='INACTIVE', updated_at=? WHERE symbol=? AND side='LONG'", (datetime.now(timezone.utc).isoformat(), symbol))
+    conn.commit()
+    conn.close()
+
+
+def _cancel_open_long_exit_orders(symbol: str, cancel_tp: bool = True, cancel_sl: bool = False):
+    try:
+        orders = client.futures_get_open_orders(symbol=symbol)
+    except Exception:
+        return
+    for o in orders:
+        if o.get("side") != "SELL":
+            continue
+        if o.get("positionSide") not in ("LONG", None, "BOTH"):
+            continue
+        typ = o.get("type")
+        if typ == "TAKE_PROFIT_MARKET" and cancel_tp:
+            client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
+        if typ == "STOP_MARKET" and cancel_sl:
+            client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
+
+
+def _place_or_replace_long_stop(symbol: str, qty: float, stop_price: float):
+    info = get_symbol_info(symbol)
+    qty = round_step(qty, info["stepSize"])
+    stop_price = round_step(stop_price, info["tickSize"])
+    if qty <= 0:
+        return None
+    _cancel_open_long_exit_orders(symbol, cancel_tp=False, cancel_sl=True)
+    return client.futures_create_order(
+        symbol=symbol,
+        side=SIDE_SELL,
+        positionSide="LONG",
+        type="STOP_MARKET",
+        quantity=qty,
+        stopPrice=stop_price,
+        reduceOnly=True,
+        timeInForce="GTE_GTC",
+    )
+
+
+def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_half: bool = False):
+    """方案C(v1.0)执行器：+2%保本，+4%平半，剩余仓位移动止损。"""
+    positions = client.futures_position_information(symbol=symbol)
+    pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
+    if not pos:
+        _deactivate_long_strategy_state(symbol)
+        out = {"status": "no_long_position", "symbol": symbol}
+        print(json.dumps(out, indent=2))
+        return out
+
+    qty = abs(float(pos["positionAmt"]))
+    entry = float(pos["entryPrice"])
+    mark = float(pos["markPrice"])
+    info = get_symbol_info(symbol)
+
+    st = _load_long_strategy_state(symbol)
+    if not st:
+        _upsert_long_strategy_state(symbol, entry, qty, trail_gap_pct)
+        st = _load_long_strategy_state(symbol)
+
+    _, st_entry, qty_init, qty_rem, be_set, half_taken, gap, max_price, stage = st
+    gap = float(gap if gap else trail_gap_pct)
+    max_price = max(float(max_price if max_price else mark), mark)
+
+    # 进入方案C后，关闭原始整仓 TP，避免与“+4%平半”冲突
+    _cancel_open_long_exit_orders(symbol, cancel_tp=True, cancel_sl=False)
+
+    actions = []
+    pnl_pct = (mark - st_entry) / st_entry * 100 if st_entry else 0.0
+
+    if (not be_set) and pnl_pct >= 2.0:
+        _place_or_replace_long_stop(symbol, qty, st_entry)
+        be_set = 1
+        stage = "BREAKEVEN"
+        actions.append("move_sl_to_breakeven")
+
+    if (not half_taken) and (pnl_pct >= 4.0 or force_half):
+        close_qty = round_step(max(qty * 0.5, info["stepSize"]), info["stepSize"])
+        if close_qty > 0 and close_qty < qty:
+            client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL,
+                positionSide="LONG",
+                type=FUTURE_ORDER_TYPE_MARKET,
+                quantity=close_qty,
+                reduceOnly=True,
+            )
+            actions.append(f"take_profit_half:{close_qty}")
+        # refresh position
+        positions = client.futures_position_information(symbol=symbol)
+        pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
+        qty = abs(float(pos["positionAmt"])) if pos else 0.0
+        half_taken = 1
+        stage = "HALF_TAKEN"
+
+    if half_taken and qty > 0:
+        trail_stop = max(st_entry, max_price * (1 - gap / 100))
+        _place_or_replace_long_stop(symbol, qty, trail_stop)
+        actions.append(f"trail_sl:{round(trail_stop,4)}")
+        stage = "TRAILING"
+
+    _save_long_strategy_state(
+        symbol,
+        qty_remaining=qty,
+        break_even_set=be_set,
+        half_taken=half_taken,
+        trail_gap_pct=gap,
+        max_price=max_price,
+        stage=stage,
+    )
+
+    out = {
+        "status": "ok",
+        "symbol": symbol,
+        "entry_price": round(st_entry, 6),
+        "mark_price": round(mark, 6),
+        "pnl_pct": round(pnl_pct, 4),
+        "qty_remaining": round(qty, 6),
+        "stage": stage,
+        "trail_gap_pct": gap,
+        "actions": actions,
+    }
+    print(json.dumps(out, indent=2))
+    return out
 
 
 def get_futures_algo_open_orders(symbol: str | None = None):
@@ -190,7 +385,7 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
         "tp_order_id": tp_order.get("orderId"),
     }
 
-    # 写入交易记录
+    # 写入交易记录 + 初始化方案C状态
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
@@ -199,6 +394,7 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
         )
         conn.commit()
         conn.close()
+        _upsert_long_strategy_state(symbol, entry_price, qty, trail_gap_pct=1.5)
     except Exception as e:
         print(f"[DB] 写入失败: {e}")
 
@@ -276,6 +472,8 @@ def sell(symbol: str) -> dict:
         conn.close()
     except Exception as e:
         print(f"[DB] 更新失败: {e}")
+
+    _deactivate_long_strategy_state(symbol)
 
     result = {
         "status": "closed",
@@ -704,6 +902,12 @@ if __name__ == "__main__":
 
     elif cmd == "snapshot":
         snapshot_equity()
+
+    elif cmd == "manage-long":
+        symbol = sys.argv[2].upper()
+        gap = float(sys.argv[3]) if len(sys.argv) > 3 else 1.5
+        force_half = (len(sys.argv) > 4 and sys.argv[4].lower() in {"1", "true", "yes", "force", "force_half"})
+        manage_long_tp(symbol, trail_gap_pct=gap, force_half=force_half)
 
     elif cmd == "sync":
         symbol = sys.argv[2].upper() if len(sys.argv) > 2 else "ETHUSDT"
