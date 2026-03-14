@@ -1224,7 +1224,7 @@ async function loadTrades(){
   const closed=d.filter(t=>t.status==='CLOSED');
   const totalFee=closed.reduce((s,t)=>s+((t.fee_usdt||0)),0);
   const totalGross=closed.reduce((s,t)=>s+((t.gross_pnl_usdt||t.pnl_usdt||0)),0);
-  const totalPnl=closed.reduce((s,t)=>s+(((t.net_pnl_usdt ?? t.pnl_usdt) || 0)),0);
+  const totalPnl=closed.reduce((s,t)=>s+(((t.net_pnl_usdt!=null?t.net_pnl_usdt:t.pnl_usdt) || 0)),0);
   const roiPct=INITIAL_CAPITAL_USDT>0?(totalPnl/INITIAL_CAPITAL_USDT*100):0;
   const roiText=`${totalPnl>=0?'+':''}${fmt(roiPct,2)}%`;
   const wins=closed.filter(t=>(t.pnl_usdt||0)>0).length;
@@ -1245,9 +1245,9 @@ async function loadTrades(){
     <td>${t.qty!=null?fmt(t.qty,4):'-'}</td>
     <td>${fmt(t.entry_price,4)}</td>
     <td>${t.exit_price?fmt(t.exit_price,4):'-'}</td>
-    <td class="${cls(t.gross_pnl_usdt??t.pnl_usdt)}">${(t.gross_pnl_usdt??t.pnl_usdt)!=null?fmt((t.gross_pnl_usdt??t.pnl_usdt)):'-'}</td>
+    <td class="${cls((t.gross_pnl_usdt!=null?t.gross_pnl_usdt:t.pnl_usdt))}">${(t.gross_pnl_usdt!=null?t.gross_pnl_usdt:t.pnl_usdt)!=null?fmt((t.gross_pnl_usdt!=null?t.gross_pnl_usdt:t.pnl_usdt)):'-'}</td>
     <td class="neg">${t.fee_usdt!=null?fmt(t.fee_usdt):'-'}</td>
-    <td class="${cls(t.net_pnl_usdt??t.pnl_usdt)}">${(t.net_pnl_usdt??t.pnl_usdt)!=null?fmt((t.net_pnl_usdt??t.pnl_usdt)):'-'}</td>
+    <td class="${cls((t.net_pnl_usdt!=null?t.net_pnl_usdt:t.pnl_usdt))}">${(t.net_pnl_usdt!=null?t.net_pnl_usdt:t.pnl_usdt)!=null?fmt((t.net_pnl_usdt!=null?t.net_pnl_usdt:t.pnl_usdt)):'-'}</td>
     <td>${t.status}</td></tr>`).join('');
 }
 
