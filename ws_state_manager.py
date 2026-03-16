@@ -212,8 +212,8 @@ class WSStateManager:
 
         entry = float(pos["entryPrice"])
         qty = abs(float(pos["positionAmt"]))
-        price = self._latest_price(symbol)
-        be_trigger = entry * 1.015
+        tp1_pct = float(scfg.get("tp1_trigger_pct", 3.0))
+        tp2_pct = float(scfg.get("tp2_trigger_pct", 4.0))
         tp1_qty_threshold = qty <= round((0.079 - 0.026) + 1e-6, 3)  # backward compatible quick threshold for current sizing
         tp2_qty_threshold = qty <= round((0.079 - 0.052) + 1e-6, 3)
 
@@ -225,36 +225,33 @@ class WSStateManager:
             self._save_state(symbol, st)
             audit(symbol, prev, st["stage"], "detect_tp1_qty_drop", {"qty": qty}, {"ok": True}, True)
 
+            # v2.0: TP1触发时，同步移SL到保本
+            if (not st["be_moved"]) and self._idempotent(st, symbol, "move_be_on_tp1"):
+                req = {"entry": entry, "trigger": f"tp1@{tp1_pct}%", "qty": qty}
+                try:
+                    open_algo = self._open_algo(symbol)
+                    cancelled = []
+                    for a in open_algo:
+                        if a.get("side") == "SELL" and a.get("positionSide") == "LONG":
+                            tp = float(a.get("triggerPrice", "0") or 0)
+                            if tp > 0 and tp < entry:
+                                self._cancel_algo(symbol, int(a["algoId"]))
+                                cancelled.append(a["algoId"])
+                    placed = self._place_stop_market(symbol, qty, entry)
+                    st["be_moved"] = 1
+                    st["stage"] = "TP1_BE_MOVED"
+                    self._save_state(symbol, st)
+                    audit(symbol, "TP1_OBSERVED", st["stage"], "move_sl_to_breakeven", req, {"cancelled": cancelled, "placed": placed}, True)
+                except Exception as e:
+                    audit(symbol, "TP1_OBSERVED", "TP1_OBSERVED", "move_sl_to_breakeven", req, {"error": str(e)}, False)
+                    alert(f"WS_STATE move SL on TP1 failed {symbol}: {e}")
+
         if st["tp1_seen"] and (not st["tp2_seen"]) and tp2_qty_threshold:
             prev = st["stage"]
             st["tp2_seen"] = 1
             st["stage"] = "TP2_OBSERVED"
             self._save_state(symbol, st)
             audit(symbol, prev, st["stage"], "detect_tp2_qty_drop", {"qty": qty}, {"ok": True}, True)
-
-        # +1.5% move SL to breakeven
-        if (not st["be_moved"]) and price >= be_trigger:
-            if self._idempotent(st, symbol, "move_be"):
-                prev = st["stage"]
-                req = {"entry": entry, "trigger": be_trigger, "qty": qty}
-                try:
-                    # Cancel current protective stop below entry for LONG
-                    open_algo = self._open_algo(symbol)
-                    cancelled = []
-                    for a in open_algo:
-                        if a.get("side") == "SELL" and a.get("positionSide") == "LONG":
-                            tp = float(a.get("triggerPrice", "0") or 0)
-                            if tp > 0 and tp < entry:  # protective SL
-                                self._cancel_algo(symbol, int(a["algoId"]))
-                                cancelled.append(a["algoId"])
-                    placed = self._place_stop_market(symbol, qty, entry)
-                    st["be_moved"] = 1
-                    st["stage"] = "BE_MOVED"
-                    self._save_state(symbol, st)
-                    audit(symbol, prev, st["stage"], "move_sl_to_breakeven", req, {"cancelled": cancelled, "placed": placed}, True)
-                except Exception as e:
-                    audit(symbol, prev, prev, "move_sl_to_breakeven", req, {"error": str(e)}, False)
-                    alert(f"WS_STATE move SL failed {symbol}: {e}")
 
         # After TP2, place trailing on remaining qty
         if st["tp2_seen"] and (not st["trailing_active"]):
@@ -307,8 +304,8 @@ class WSStateManager:
                             continue
                         entry = float(pos["entryPrice"])
                         p = self._latest_price(symbol)
-                        tp1 = entry * 1.03
-                        tp2 = entry * 1.04
+                        tp1 = entry * (1 + float(scfg.get("tp1_trigger_pct", 3.0)) / 100)
+                        tp2 = entry * (1 + float(scfg.get("tp2_trigger_pct", 4.0)) / 100)
                         if abs(p - tp1) / tp1 < 0.003 or abs(p - tp2) / tp2 < 0.003:
                             sleep_s = 10
                             break
@@ -328,9 +325,9 @@ class WSStateManager:
         # synthetic flow for state transitions
         stages = [
             ("INIT", "INIT", "boot", True),
-            ("INIT", "BE_MOVED", "move_sl_to_breakeven", True),
-            ("BE_MOVED", "TP1_OBSERVED", "detect_tp1_qty_drop", True),
-            ("TP1_OBSERVED", "TP2_OBSERVED", "detect_tp2_qty_drop", True),
+            ("INIT", "TP1_OBSERVED", "detect_tp1_qty_drop", True),
+            ("TP1_OBSERVED", "TP1_BE_MOVED", "move_sl_to_breakeven", True),
+            ("TP1_BE_MOVED", "TP2_OBSERVED", "detect_tp2_qty_drop", True),
             ("TP2_OBSERVED", "TRAILING_ACTIVE", "place_trailing", True),
         ]
         for sf, st, action, ok in stages:
@@ -341,7 +338,7 @@ class WSStateManager:
 def default_cfg():
     return {
         "symbols": [
-            {"symbol": "ETHUSDT", "enabled": True, "trail_callback_rate": 1.5}
+            {"symbol": "ETHUSDT", "enabled": True, "tp1_trigger_pct": 3.0, "tp2_trigger_pct": 4.0, "trail_callback_rate": 1.5}
         ]
     }
 

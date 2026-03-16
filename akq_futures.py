@@ -295,7 +295,7 @@ def _compute_trend_ok(symbol: str):
 
 
 def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = False, fg_now: float | None = None):
-    """方案C(v1.1)执行器：+1.5%保本，+3%平1/3，+4%再平1/3，余仓trailing；含FG/假突破/48h审查。"""
+    """方案C(v2.0)执行器：+3%同步保本+平1/3，+4%再平1/3，余仓trailing；含FG/假突破/48h审查。"""
     positions = client.futures_position_information(symbol=symbol)
     pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
     if not pos:
@@ -369,15 +369,14 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = Fa
             print(json.dumps(out, indent=2))
             return out
 
-    # +1.5% 移到保本
-    if (not be_set) and pnl_pct >= 1.5:
-        _place_or_replace_long_stop(symbol, qty, st_entry)
-        be_set = 1
-        stage = "BREAKEVEN"
-        actions.append("move_sl_to_breakeven")
-
-    # +3% 平1/3
+    # +3% 同步：移到保本 + 平1/3
     if (not tp1_taken) and (pnl_pct >= 3.0 or force_tp1):
+        if not be_set:
+            _place_or_replace_long_stop(symbol, qty, st_entry)
+            be_set = 1
+            actions.append("move_sl_to_breakeven_on_tp1")
+        stage = "BREAKEVEN"
+
         close_qty = round_step(max(qty_init / 3.0, info["stepSize"]), info["stepSize"])
         close_qty = min(close_qty, qty)
         if close_qty > 0 and close_qty < qty:

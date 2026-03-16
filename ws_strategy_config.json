@@ -3,6 +3,8 @@
     {
       "symbol": "ETHUSDT",
       "enabled": true,
+      "tp1_trigger_pct": 3.0,
+      "tp2_trigger_pct": 4.0,
       "trail_callback_rate": 1.5
     }
   ]
