@@ -1167,6 +1167,12 @@ td{padding:7px 6px;border-bottom:1px solid #161b22}
 const $=s=>document.getElementById(s);
 const fmt=(v,d=2)=>v!=null?Number(v).toFixed(d):'-';
 const cls=v=>v>=0?'pos':'neg';
+const grossPnl=(t)=>{
+  if(t.exit_price==null || t.entry_price==null || t.qty==null) return null;
+  const side=(t.side||'LONG').toUpperCase();
+  const diff=Number(t.exit_price)-Number(t.entry_price);
+  return side==='SHORT' ? (-diff*Number(t.qty)) : (diff*Number(t.qty));
+};
 const INITIAL_CAPITAL_USDT = 147.20; // Kingo 入金本金，可按需调整
 const DASH_TOKEN = new URLSearchParams(window.location.search).get('token');
 
@@ -1215,8 +1221,8 @@ async function loadTrades(){
   if(d.error){$('stats').innerHTML='<span class="neg">Error</span>';$('trades').innerHTML='<tr><td colspan="11" class="neg">Error</td></tr>';return;}
   const closed=d.filter(t=>t.status==='CLOSED');
   const totalFee=closed.reduce((s,t)=>s+((t.fee_usdt||0)),0);
-  const totalGross=closed.reduce((s,t)=>s+((t.gross_pnl_usdt||t.pnl_usdt||0)),0);
-  const totalPnl=closed.reduce((s,t)=>s+(((t.net_pnl_usdt!=null?t.net_pnl_usdt:t.pnl_usdt) || 0)),0);
+  const totalGross=closed.reduce((s,t)=>s+((grossPnl(t) || 0)),0);
+  const totalPnl=closed.reduce((s,t)=>s+((t.pnl_usdt||0)),0);
   const roiPct=INITIAL_CAPITAL_USDT>0?(totalPnl/INITIAL_CAPITAL_USDT*100):0;
   const roiText=`${totalPnl>=0?'+':''}${fmt(roiPct,2)}%`;
   const wins=closed.filter(t=>(t.pnl_usdt||0)>0).length;
@@ -1229,7 +1235,11 @@ async function loadTrades(){
     <div class="stat-item"><div class="val">${fmt(winRate,1)}%</div><div class="lbl">Win Rate</div></div>
     <div class="stat-item"><div class="val">${closed.length}</div><div class="lbl">Closed</div></div>`;
   if(!d.length){$('trades').innerHTML='<tr><td colspan="11" style="color:#484f58">No trades yet</td></tr>';return;}
-  $('trades').innerHTML=d.map(t=>`<tr>
+  $('trades').innerHTML=d.map(t=>{
+    const gross=grossPnl(t);
+    const fee=t.fee_usdt;
+    const net=t.pnl_usdt;
+    return `<tr>
     <td>${t.open_time?t.open_time.replace('T',' ').slice(0,19):'-'}</td>
     <td>${t.close_time?t.close_time.replace('T',' ').slice(0,19):'-'}</td>
     <td>${t.symbol}</td>
@@ -1237,10 +1247,11 @@ async function loadTrades(){
     <td>${t.qty!=null?fmt(t.qty,4):'-'}</td>
     <td>${fmt(t.entry_price,4)}</td>
     <td>${t.exit_price?fmt(t.exit_price,4):'-'}</td>
-    <td class="${cls((t.gross_pnl_usdt!=null?t.gross_pnl_usdt:t.pnl_usdt))}">${(t.gross_pnl_usdt!=null?t.gross_pnl_usdt:t.pnl_usdt)!=null?fmt((t.gross_pnl_usdt!=null?t.gross_pnl_usdt:t.pnl_usdt)):'-'}</td>
-    <td class="neg">${t.fee_usdt!=null?fmt(t.fee_usdt):'-'}</td>
-    <td class="${cls((t.net_pnl_usdt!=null?t.net_pnl_usdt:t.pnl_usdt))}">${(t.net_pnl_usdt!=null?t.net_pnl_usdt:t.pnl_usdt)!=null?fmt((t.net_pnl_usdt!=null?t.net_pnl_usdt:t.pnl_usdt)):'-'}</td>
-    <td>${t.status}</td></tr>`).join('');
+    <td class="${gross!=null?cls(gross):''}">${gross!=null?fmt(gross):'-'}</td>
+    <td class="${fee!=null?cls(-Math.abs(fee)):''}">${fee!=null?fmt(fee):'-'}</td>
+    <td class="${net!=null?cls(net):''}">${net!=null?fmt(net):'-'}</td>
+    <td>${t.status}</td></tr>`;
+  }).join('');
 }
 
 let eqChart;
