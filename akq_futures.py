@@ -549,16 +549,16 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
     tp_price = round_step(entry_price * (1 + tp_pct / 100), info["tickSize"])
 
     # 5. 挂止损单 (STOP_MARKET) / 止盈单 (TAKE_PROFIT_MARKET)
-    # 不再使用 closePosition=True，改为指定数量，确保 open_orders 可见、可核验
+    # 币安当前接口下，条件单应使用 closePosition=True（避免 reduceOnly 参数报错）
     sl_order = client.futures_create_order(
         symbol=symbol,
         side=SIDE_SELL,
         positionSide="LONG",
         type="STOP_MARKET",
-        quantity=qty,
         stopPrice=sl_price,
-        reduceOnly=True,
-        timeInForce="GTE_GTC",
+        closePosition=True,
+        workingType="MARK_PRICE",
+        priceProtect=True,
     )
 
     tp_order = client.futures_create_order(
@@ -566,10 +566,10 @@ def buy(symbol: str, usdt_amount: float, leverage: int,
         side=SIDE_SELL,
         positionSide="LONG",
         type="TAKE_PROFIT_MARKET",
-        quantity=qty,
         stopPrice=tp_price,
-        reduceOnly=True,
-        timeInForce="GTE_GTC",
+        closePosition=True,
+        workingType="MARK_PRICE",
+        priceProtect=True,
     )
 
     result = {
