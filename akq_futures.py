@@ -27,6 +27,7 @@ from binance.enums import *
 
 DB_PATH = "/home/azureuser/akq-trader/trades.db"
 TAKER_FEE_RATE = 0.0004  # 0.04% each side
+TP_FRACTION = 1.0 / 3.0   # 方案C: TP1/TP2 各按初始仓位 1/3
 
 # ── 加载 API Key ─────────────────────────────────────────
 def load_env(path="/home/azureuser/.benv"):
@@ -377,7 +378,7 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = Fa
             actions.append("move_sl_to_breakeven_on_tp1")
         stage = "BREAKEVEN"
 
-        close_qty = round_step(max(qty_init / 3.0, info["stepSize"]), info["stepSize"])
+        close_qty = round_step(max(qty_init * TP_FRACTION, info["stepSize"]), info["stepSize"])
         close_qty = min(close_qty, qty)
         if close_qty > 0 and close_qty < qty:
             client.futures_create_order(
@@ -398,7 +399,7 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = Fa
 
     # +4% 再平1/3
     if tp1_taken and (not tp2_taken) and pnl_pct >= 4.0 and qty > 0:
-        close_qty = round_step(max(qty_init / 3.0, info["stepSize"]), info["stepSize"])
+        close_qty = round_step(max(qty_init * TP_FRACTION, info["stepSize"]), info["stepSize"])
         close_qty = min(close_qty, qty)
         if close_qty > 0 and close_qty < qty:
             client.futures_create_order(
