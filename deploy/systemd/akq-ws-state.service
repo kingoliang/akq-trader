@@ -1,0 +1,17 @@
+[Unit]
+Description=AKQ WS Strategy State Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/akq-trader
+ExecStart=/tmp/bnb_venv/bin/python3 /home/azureuser/akq-trader/ws_state_manager.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/azureuser/akq-trader/ws_state_manager.log
+StandardError=append:/home/azureuser/akq-trader/ws_state_manager.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+{
+  "symbols": [
+    {
+      "symbol": "ETHUSDT",
+      "enabled": true,
+      "trail_callback_rate": 1.5
+    }
+  ]
+}
