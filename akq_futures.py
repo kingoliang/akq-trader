@@ -659,8 +659,10 @@ def sell(symbol: str) -> dict:
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
-            "UPDATE trades SET close_time=?, exit_price=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
-            (datetime.now(timezone.utc).isoformat(), exit_price, pnl, symbol)
+            """UPDATE trades
+               SET close_time=?, exit_price=?, gross_pnl_usdt=?, fee_usdt=?, net_pnl_usdt=?, pnl_usdt=?, status='CLOSED'
+               WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1""",
+            (datetime.now(timezone.utc).isoformat(), exit_price, gross_pnl, fee_usdt, pnl, pnl, symbol)
         )
         # 记录权益曲线
         balances = client.futures_account_balance()
@@ -873,8 +875,10 @@ def cover(symbol: str) -> dict:
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
-            "UPDATE trades SET close_time=?, exit_price=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND side='SHORT' AND status='OPEN' ORDER BY id DESC LIMIT 1",
-            (datetime.now(timezone.utc).isoformat(), exit_price, pnl, symbol)
+            """UPDATE trades
+               SET close_time=?, exit_price=?, gross_pnl_usdt=?, fee_usdt=?, net_pnl_usdt=?, pnl_usdt=?, status='CLOSED'
+               WHERE symbol=? AND side='SHORT' AND status='OPEN' ORDER BY id DESC LIMIT 1""",
+            (datetime.now(timezone.utc).isoformat(), exit_price, gross_pnl, fee_usdt, pnl, pnl, symbol)
         )
         balances = client.futures_account_balance()
         usdt_bal = next((b for b in balances if b["asset"] == "USDT"), None)
@@ -975,7 +979,6 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
         exit_price = close_d["price_sum"] / close_d["qty_sum"]
         exit_time = datetime.fromtimestamp(close_d["time"] / 1000, tz=timezone.utc).isoformat()
         qty = close_d["qty"]
-        pnl = close_d["pnl"]
 
         open_d = find_last_open(opens, close_d["time"])
         if open_d:
@@ -984,6 +987,8 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
         else:
             entry_price = exit_price
             open_time = exit_time
+
+        gross_pnl, fee_usdt, net_pnl = _net_pnl_after_taker_fee(entry_price, exit_price, qty, direction)
 
         # 去重（增强版）：
         # 1) 精确去重：symbol + side + close_time
@@ -1016,14 +1021,16 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
         conn.execute(
             """INSERT INTO trades
                (open_time, close_time, symbol, side, qty, entry_price, exit_price,
-                leverage, sl_price, tp_price, status, margin_usdt, pnl_usdt)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                leverage, sl_price, tp_price, status, margin_usdt,
+                gross_pnl_usdt, fee_usdt, net_pnl_usdt, pnl_usdt)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (open_time, exit_time, symbol, direction, qty,
              round(entry_price, 4), round(exit_price, 4),
-             None, None, None, "CLOSED", None, round(pnl, 6))
+             None, None, None, "CLOSED", None,
+             round(gross_pnl, 6), round(fee_usdt, 6), round(net_pnl, 6), round(net_pnl, 6))
         )
         inserted += 1
-        print(f"[sync] 补录: {symbol} {direction} {exit_time} entry={entry_price:.2f} exit={exit_price:.2f} pnl={pnl:.4f}")
+        print(f"[sync] 补录: {symbol} {direction} {exit_time} entry={entry_price:.2f} exit={exit_price:.2f} gross={gross_pnl:.4f} fee={fee_usdt:.4f} net={net_pnl:.4f}")
 
     for _, cd in long_closes:
         insert_close(cd, "LONG", long_opens)
