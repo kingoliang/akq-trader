@@ -10,6 +10,8 @@ AKQ Trading API v2.1 — Unified Flask service (port 5001)
 - Audit logging
 """
 import os
+import sys
+from pathlib import Path
 import re
 import json
 import math
@@ -25,6 +27,10 @@ from datetime import datetime, timezone
 from functools import wraps
 from urllib.parse import urlencode
 from flask import Flask, jsonify, request
+
+# allow importing sibling modules from repo root
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from core.task_tracker import TaskTracker, TaskTrackerError
 
 DB_PATH = "/home/azureuser/akq-trader/trades.db"
 ENV_PATH = "/home/azureuser/.benv"
@@ -195,6 +201,10 @@ def init_db():
     conn.close()
 
 init_db()
+
+# ── Task Tracker ───────────────────────────────────────────
+task_tracker = TaskTracker(DB_PATH)
+task_tracker.init_db()
 
 # ═══════════════════════════════════════════════════════════
 # PUBLIC ENDPOINTS
@@ -762,12 +772,106 @@ def api_trade_sell():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+
+# ═══════════════════════════════════════════════════════════
+# AUTHENTICATED API — TASK TRACKER (IC-*)
+# ═══════════════════════════════════════════════════════════
+@app.route("/api/task/create", methods=["POST"])
+@require_auth
+def api_task_create():
+    try:
+        body = request.get_json(force=True) or {}
+        task_id = (body.get("task_id") or "").strip().upper()
+        required_actors = body.get("required_actors") or body.get("assignees") or []
+        data = task_tracker.create_task(
+            task_id=task_id,
+            created_by=(body.get("created_by") or "system"),
+            required_actors=required_actors,
+            due_at=body.get("due_at"),
+            metadata=body.get("metadata") or {},
+        )
+        return jsonify({"ok": True, "data": data, "idempotent": bool(data.get("idempotent"))})
+    except TaskTrackerError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/task/done", methods=["POST"])
+@require_auth
+def api_task_done():
+    try:
+        body = request.get_json(force=True) or {}
+        task_id = (body.get("task_id") or "").strip().upper()
+        actor = (body.get("actor") or "").strip()
+        data = task_tracker.done_task(task_id=task_id, actor=actor, metadata=body.get("metadata") or {})
+        return jsonify({"ok": True, "data": data, "idempotent": bool(data.get("idempotent"))})
+    except TaskTrackerError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/task/decide", methods=["POST"])
+@require_auth
+def api_task_decide():
+    try:
+        body = request.get_json(force=True) or {}
+        task_id = (body.get("task_id") or "").strip().upper()
+        actor = (body.get("actor") or "CEO").strip()
+        decision = body.get("decision")
+        data = task_tracker.decide_task(task_id=task_id, actor=actor, decision_text=decision, metadata=body.get("metadata") or {})
+        return jsonify({"ok": True, "data": data, "idempotent": bool(data.get("idempotent"))})
+    except TaskTrackerError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/task/close", methods=["POST"])
+@require_auth
+def api_task_close():
+    try:
+        body = request.get_json(force=True) or {}
+        task_id = (body.get("task_id") or "").strip().upper()
+        actor = (body.get("actor") or "system").strip()
+        reason = body.get("reason")
+        data = task_tracker.close_task(task_id=task_id, actor=actor, reason=reason)
+        return jsonify({"ok": True, "data": data, "idempotent": bool(data.get("idempotent"))})
+    except TaskTrackerError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/task/active")
+@require_auth
+def api_task_active():
+    try:
+        data = task_tracker.list_active()
+        return jsonify({"ok": True, "data": data})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/task/overdue")
+@require_auth
+def api_task_overdue():
+    try:
+        touch = request.args.get("touch", "1") in {"1", "true", "yes"}
+        data = task_tracker.list_overdue(touch=touch)
+        return jsonify({"ok": True, "data": data, "cooldown_minutes": task_tracker.config.reminder_cooldown_min})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ═══════════════════════════════════════════════════════════
 # WATCHDOG — Background condition-based alerts
 # ═══════════════════════════════════════════════════════════
 watchdog_running = False
 _alert_cooldowns = {}  # key -> last alert timestamp (prevent spam)
 ALERT_COOLDOWN_SECS = 3600  # 1 hour cooldown per condition
+_watchdog_prev_positions: dict = {}  # symbol -> bool (had position last cycle)
 
 DEFAULT_WATCHDOG_CONFIG = {
     "enabled": True,
@@ -779,6 +883,7 @@ DEFAULT_WATCHDOG_CONFIG = {
         "pnl_gain_pct": 1.0,
         "pnl_loss_pct": 1.0,
         "price_near_sl_pct": 3.0,
+        "volume_spike_ratio": 1.5,
     }
 }
 
@@ -824,6 +929,27 @@ def calc_bb(closes, period=20):
 
 def calc_ma(closes, period):
     return np.mean(closes[-period:])
+
+
+def calc_macd_hist(closes, fast=12, slow=26, signal=9):
+    closes = np.array(closes, dtype=float)
+    if len(closes) < slow + signal:
+        return np.array([])
+
+    def ema(arr, period):
+        alpha = 2 / (period + 1)
+        out = np.zeros_like(arr, dtype=float)
+        out[0] = arr[0]
+        for i in range(1, len(arr)):
+            out[i] = alpha * arr[i] + (1 - alpha) * out[i - 1]
+        return out
+
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd = ema_fast - ema_slow
+    sig = ema(macd, signal)
+    hist = macd - sig
+    return hist
 
 OPENCLAW_GATEWAY_URL = "http://127.0.0.1:18789/tools/invoke"
 OPENCLAW_GATEWAY_TOKEN = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
@@ -882,6 +1008,14 @@ def send_discord_alert(message):
         f.write(json.dumps(alert) + "\n")
     watchdog_logger.info("Alert written to file (fallback)")
 
+def sync_closed_trades_for_watchdog(symbol: str):
+    """Sync closed trade records when a position disappears (SL/TP hit)."""
+    try:
+        from akq_futures import sync_closed_trades
+        sync_closed_trades(symbol=symbol, limit=20)
+    except Exception as e:
+        watchdog_logger.info("ERROR syncing closed trades for %s: %s", symbol, str(e))
+
 def watchdog_check():
     """Single watchdog check cycle"""
     config = load_watchdog_config()
@@ -925,20 +1059,33 @@ def watchdog_check():
                 if 0 < dist_pct < near_sl and should_alert(f"near_sl_{symbol}"):
                     send_discord_alert(f"⚠️ {symbol} 距止损 ${sl:.2f} 仅 {dist_pct:.1f}% (mark=${mark:.2f})")
 
+        # Detect positions that disappeared (SL/TP triggered) and sync DB
+        current_pos_symbols = {p["symbol"] for p in positions if float(p["positionAmt"]) != 0}
+        for sym in config.get("symbols", []):
+            has_pos = sym in current_pos_symbols
+            had_pos = _watchdog_prev_positions.get(sym, False)
+            if had_pos and not has_pos:
+                watchdog_logger.info("Position closed for %s, syncing trade records", sym)
+                sync_closed_trades_for_watchdog(sym)
+            _watchdog_prev_positions[sym] = has_pos
+
     except Exception as e:
         watchdog_logger.info("ERROR checking positions: %s", str(e))
 
     # Check market indicators for watched symbols
     for symbol in config.get("symbols", []):
         try:
-            klines = client.futures_klines(symbol=symbol, interval="1h", limit=30)
+            klines = client.futures_klines(symbol=symbol, interval="1h", limit=60)
             closes = np.array([float(k[4]) for k in klines])
+            volumes = np.array([float(k[5]) for k in klines])
+            opens = np.array([float(k[1]) for k in klines])
             price = closes[-1]
 
             rsi = calc_rsi(closes)
             ma7 = calc_ma(closes, 7)
             ma25 = calc_ma(closes, min(25, len(closes)))
             bb_upper, bb_mid, bb_lower = calc_bb(closes)
+            macd_hist = calc_macd_hist(closes)
 
             rsi_high = alerts_cfg.get("rsi_high", 75)
             rsi_low = alerts_cfg.get("rsi_low", 30)
@@ -960,6 +1107,27 @@ def watchdog_check():
                 send_discord_alert(f"📊 {symbol} 站上 MA7 ${ma7:.2f} | ${price:.2f}")
             elif prev_price > ma7 >= price and should_alert(f"ma7_cross_down_{symbol}"):
                 send_discord_alert(f"📊 {symbol} 跌破 MA7 ${ma7:.2f} | ${price:.2f}")
+
+            # MACD golden/death cross via histogram sign flip on 1h
+            if len(macd_hist) >= 2:
+                prev_h, curr_h = float(macd_hist[-2]), float(macd_hist[-1])
+                if prev_h < 0 <= curr_h and should_alert(f"macd_golden_{symbol}"):
+                    send_discord_alert(f"🟡 {symbol} MACD 金叉 (Hist {prev_h:.4f}→{curr_h:.4f}) | ${price:.2f}")
+                elif prev_h > 0 >= curr_h and should_alert(f"macd_death_{symbol}"):
+                    send_discord_alert(f"⚫ {symbol} MACD 死叉 (Hist {prev_h:.4f}→{curr_h:.4f}) | ${price:.2f}")
+
+            # Volume spike alert (latest closed candle vs previous 20-candle average)
+            if len(volumes) >= 22 and len(opens) == len(closes):
+                vol_now = float(volumes[-2])
+                vol_avg = float(np.mean(volumes[-22:-2]))
+                vol_ratio = (vol_now / vol_avg) if vol_avg > 0 else 0.0
+                vol_spike_ratio = float(alerts_cfg.get("volume_spike_ratio", 1.5))
+                if vol_ratio >= vol_spike_ratio and should_alert(f"volume_spike_{symbol}"):
+                    candle_bull = closes[-2] >= opens[-2]
+                    direction = "阳线" if candle_bull else "阴线"
+                    send_discord_alert(
+                        f"📦 {symbol} 量能放大 {vol_ratio:.2f}x (>={vol_spike_ratio:.2f}) | {direction} | 收盘 ${closes[-2]:.2f}"
+                    )
 
         except Exception as e:
             watchdog_logger.info("ERROR checking %s: %s", symbol, str(e))
@@ -1082,7 +1250,33 @@ def dashboard_trades():
         conn = get_db()
         rows = conn.execute("SELECT * FROM trades ORDER BY open_time DESC, id DESC LIMIT 100").fetchall()
         conn.close()
-        return jsonify([dict(r) for r in rows])
+
+        # 修复：OPEN 记录的 qty 可能是原始开仓量；这里用交易所实时仓位覆盖为“当前剩余仓位”
+        # 避免出现 Trade History 与 Open Positions 不一致（例如 1.5 -> 部分平仓后实际 1.0）
+        pos_map = {}
+        try:
+            positions = client.futures_position_information()
+            for p in positions:
+                amt = float(p.get("positionAmt", 0) or 0)
+                if amt == 0:
+                    continue
+                symbol = p.get("symbol")
+                side = "LONG" if amt > 0 else "SHORT"
+                pos_map[(symbol, side)] = abs(amt)
+        except Exception:
+            # 若实时仓位查询失败，回退到数据库原值，避免接口整体失败
+            pos_map = {}
+
+        out = []
+        for r in rows:
+            t = dict(r)
+            if (t.get("status") or "").upper() == "OPEN":
+                key = (t.get("symbol"), (t.get("side") or "LONG").upper())
+                if key in pos_map:
+                    t["qty"] = pos_map[key]
+            out.append(t)
+
+        return jsonify(out)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
