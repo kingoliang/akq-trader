@@ -661,7 +661,7 @@ def sell(symbol: str) -> dict:
         conn.execute(
             """UPDATE trades
                SET close_time=?, exit_price=?, gross_pnl_usdt=?, fee_usdt=?, net_pnl_usdt=?, pnl_usdt=?, status='CLOSED'
-               WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1""",
+               WHERE symbol=? AND status='OPEN' ORDER BY id ASC LIMIT 1""",
             (datetime.now(timezone.utc).isoformat(), exit_price, gross_pnl, fee_usdt, pnl, pnl, symbol)
         )
         # 记录权益曲线
@@ -997,6 +997,21 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
             (symbol, direction, exit_time)
         ).fetchone()
         if existing:
+            return
+
+        # 1.5) OPEN 记录去重：若已有同方向未平仓记录，说明这笔在本地已跟踪，避免补录重复 CLOSED
+        open_existing = conn.execute(
+            """
+            SELECT id FROM trades
+            WHERE symbol=? AND side=? AND status='OPEN'
+              AND ABS(COALESCE(qty,0) - ?) < 1e-6
+              AND ABS(COALESCE(entry_price,0) - ?) < 0.02
+              AND ABS(strftime('%s', open_time) - strftime('%s', ?)) <= 180
+            LIMIT 1
+            """,
+            (symbol, direction, qty, round(entry_price, 4), open_time)
+        ).fetchone()
+        if open_existing:
             return
 
         # 2) 近似去重：防止同一笔被“实时写入 + sync补录”重复记录
