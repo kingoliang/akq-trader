@@ -659,7 +659,7 @@ def sell(symbol: str) -> dict:
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
-            "UPDATE trades SET close_time=?, exit_price=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
+            "UPDATE trades SET close_time=?, exit_price=?, pnl_usdt=?, status='CLOSED' WHERE symbol=? AND status='OPEN' ORDER BY id ASC LIMIT 1",
             (datetime.now(timezone.utc).isoformat(), exit_price, pnl, symbol)
         )
         # 记录权益曲线
@@ -986,6 +986,15 @@ def sync_closed_trades(symbol: str = "ETHUSDT", limit: int = 50):
             open_time = exit_time
 
         # 去重（增强版）：
+        # 0) 检查是否已有对应的 OPEN 记录（防止补录覆盖原始开仓记录）
+        open_existing = conn.execute(
+            "SELECT id FROM trades WHERE symbol=? AND side=? AND status='OPEN'",
+            (symbol, direction)
+        ).fetchone()
+        if open_existing:
+            # 已有 OPEN 记录，说明实时写入已处理，跳过补录
+            return
+
         # 1) 精确去重：symbol + side + close_time
         existing = conn.execute(
             "SELECT id FROM trades WHERE symbol=? AND side=? AND close_time=? AND status='CLOSED'",
