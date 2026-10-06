@@ -26,7 +26,11 @@ from binance.client import Client
 from binance.enums import *
 
 DB_PATH = "/home/azureuser/akq-trader/trades.db"
-TAKER_FEE_RATE = 0.0004  # 0.04% each side
+# 0.05% each side。2026-08-12 用 8 笔实盘回执实测: 本账户实收恒为 0.05%(无 BNB 抵扣/VIP 档),
+# 原值 0.0004 系统性少算两成手续费, 使每笔实盘看起来比实际好(8 笔累计少报亏损 0.067U)。
+# 注: 这只是估算路径; broker_live._reconcile_orphans 走的是币安真实 commission 回执, 以那个为准。
+# 若日后开通 BNB 抵扣或升 VIP 档, 此常数需重新实测。
+TAKER_FEE_RATE = 0.0005
 TP_FRACTION = 1.0 / 3.0   # 方案C: TP1/TP2 各按初始仓位 1/3
 
 # ── 加载 API Key ─────────────────────────────────────────
@@ -296,7 +300,7 @@ def _compute_trend_ok(symbol: str):
 
 
 def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = False, fg_now: float | None = None):
-    """方案C(v2.0)执行器：+3%同步保本+平1/3，+4%再平1/3，余仓trailing；含FG/假突破/48h审查。"""
+    """方案C(E2版 2026-07-30)执行器：+4%同步保本+平1/3，+6%再平1/3，余仓trailing(gap默认2.5)；含FG/假突破/48h审查。"""
     positions = client.futures_position_information(symbol=symbol)
     pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
     if not pos:
@@ -370,8 +374,8 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = Fa
             print(json.dumps(out, indent=2))
             return out
 
-    # +3% 同步：移到保本 + 平1/3
-    if (not tp1_taken) and (pnl_pct >= 3.0 or force_tp1):
+    # E2(2026-07-30): +4% 同步：移到保本 + 平1/3 (原+3%)
+    if (not tp1_taken) and (pnl_pct >= 4.0 or force_tp1):
         if not be_set:
             _place_or_replace_long_stop(symbol, qty, st_entry)
             be_set = 1
@@ -389,7 +393,7 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = Fa
                 quantity=close_qty,
                 reduceOnly=True,
             )
-            actions.append(f"take_profit_1_3_at_3pct:{close_qty}")
+            actions.append(f"take_profit_1_3_at_tp1:{close_qty}")
         positions = client.futures_position_information(symbol=symbol)
         pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
         qty = abs(float(pos["positionAmt"])) if pos else 0.0
@@ -397,8 +401,8 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = Fa
         half_taken = 1
         stage = "TP1_TAKEN"
 
-    # +4% 再平1/3
-    if tp1_taken and (not tp2_taken) and pnl_pct >= 4.0 and qty > 0:
+    # E2(2026-07-30): +6% 再平1/3 (原+4%)
+    if tp1_taken and (not tp2_taken) and pnl_pct >= 6.0 and qty > 0:
         close_qty = round_step(max(qty_init * TP_FRACTION, info["stepSize"]), info["stepSize"])
         close_qty = min(close_qty, qty)
         if close_qty > 0 and close_qty < qty:
@@ -410,7 +414,7 @@ def manage_long_tp(symbol: str, trail_gap_pct: float = 1.5, force_tp1: bool = Fa
                 quantity=close_qty,
                 reduceOnly=True,
             )
-            actions.append(f"take_profit_1_3_at_4pct:{close_qty}")
+            actions.append(f"take_profit_1_3_at_tp2:{close_qty}")
         positions = client.futures_position_information(symbol=symbol)
         pos = next((p for p in positions if p.get("positionSide") == "LONG" and float(p["positionAmt"]) > 0), None)
         qty = abs(float(pos["positionAmt"])) if pos else 0.0
@@ -661,7 +665,7 @@ def sell(symbol: str) -> dict:
         conn.execute(
             """UPDATE trades
                SET close_time=?, exit_price=?, gross_pnl_usdt=?, fee_usdt=?, net_pnl_usdt=?, pnl_usdt=?, status='CLOSED'
-               WHERE symbol=? AND status='OPEN' ORDER BY id ASC LIMIT 1""",
+               WHERE symbol=? AND side='LONG' AND status='OPEN' ORDER BY id DESC LIMIT 1""",
             (datetime.now(timezone.utc).isoformat(), exit_price, gross_pnl, fee_usdt, pnl, pnl, symbol)
         )
         # 记录权益曲线

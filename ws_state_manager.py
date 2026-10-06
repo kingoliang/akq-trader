@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
+"""
+WS State Manager - REST polling version (v3).
+
+Replaces Binance WebSocket with direct REST API calls using urllib (stdlib).
+No dependency on python-binance for market data or requests.
+Still uses Binance client for trading operations.
+"""
 import argparse
 import json
-import os
 import sqlite3
 import time
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
 from binance.client import Client
-from binance import ThreadedWebsocketManager
 
 ROOT = Path(__file__).resolve().parent
 STATE_DB = ROOT / "trades.db"
 AUDIT_LOG = ROOT / "ws_state_audit.jsonl"
 ALERT_LOG = ROOT / "pending_alerts.jsonl"
 CFG_PATH = ROOT / "ws_strategy_config.json"
+
+POLL_INTERVAL_NORMAL = 60
+POLL_INTERVAL_NEAR_TP = 10
+BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 
 
 def now_iso():
@@ -35,6 +46,15 @@ def load_keys():
     if not key or not sec:
         raise RuntimeError("Missing Binance keys in /home/azureuser/.benv")
     return key, sec
+
+
+def fetch_mark_price_rest(symbol: str) -> float:
+    """Fetch mark price via Binance Futures REST API using urllib (no auth needed)."""
+    url = f"{BINANCE_FUTURES_BASE}/fapi/v1/premiumIndex?symbol={symbol}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode())
+    return float(data["markPrice"])
 
 
 def audit(symbol: str, stage_from: str, stage_to: str, action: str, request: dict, response: dict, success: bool):
@@ -66,14 +86,17 @@ class SymbolCfg:
 
 
 class WSStateManager:
+    """
+    State manager using REST polling instead of WebSocket.
+    Class name kept for compatibility. No WebSocket connection.
+    Uses urllib for mark price, Binance client for trading.
+    """
+
     def __init__(self, client: Client, cfg: Dict, simulate: bool = False):
         self.client = client
         self.cfg = cfg
         self.simulate = simulate
         self.latest_mark: Dict[str, float] = {}
-        self.last_ws_tick = 0.0
-        self.degraded = False
-        self.twm = None
         self._init_db()
 
     def _init_db(self):
@@ -128,31 +151,17 @@ class WSStateManager:
         st["last_action_key"] = key
         return True
 
-    def _start_ws(self):
-        key, sec = load_keys()
-        self.twm = ThreadedWebsocketManager(api_key=key, api_secret=sec)
-        self.twm.start()
-
-        symbols = [s["symbol"].lower() for s in self.cfg["symbols"] if s.get("enabled", True)]
-
-        def cb(msg):
-            try:
-                data = msg.get("data", msg)
-                if data.get("e") == "markPriceUpdate":
-                    sym = data["s"]
-                    self.latest_mark[sym] = float(data["p"])
-                    self.last_ws_tick = time.time()
-            except Exception:
-                pass
-
-        streams = [f"{s}@markPrice@1s" for s in symbols]
-        self.twm.start_multiplex_socket(callback=cb, streams=streams)
-        self.last_ws_tick = time.time()
-
-    def _stop_ws(self):
-        if self.twm:
-            self.twm.stop()
-            self.twm = None
+    def _fetch_mark_price(self, symbol: str) -> float:
+        """Fetch mark price via REST."""
+        try:
+            price = fetch_mark_price_rest(symbol)
+            self.latest_mark[symbol] = price
+            return price
+        except Exception as e:
+            alert(f"REST mark_price fetch failed {symbol}: {e}")
+            if symbol in self.latest_mark:
+                return self.latest_mark[symbol]
+            raise
 
     def _position(self, symbol: str):
         positions = self.client.futures_position_information(symbol=symbol)
@@ -195,7 +204,7 @@ class WSStateManager:
     def _latest_price(self, symbol: str):
         if symbol in self.latest_mark:
             return self.latest_mark[symbol]
-        return float(self.client.futures_mark_price(symbol=symbol)["markPrice"])
+        return self._fetch_mark_price(symbol)
 
     def _check_symbol(self, scfg: dict):
         symbol = scfg["symbol"]
@@ -214,10 +223,14 @@ class WSStateManager:
         qty = abs(float(pos["positionAmt"]))
         tp1_pct = float(scfg.get("tp1_trigger_pct", 3.0))
         tp2_pct = float(scfg.get("tp2_trigger_pct", 4.0))
-        tp1_qty_threshold = qty <= round((0.079 - 0.026) + 1e-6, 3)  # backward compatible quick threshold for current sizing
+        tp1_qty_threshold = qty <= round((0.079 - 0.026) + 1e-6, 3)
         tp2_qty_threshold = qty <= round((0.079 - 0.052) + 1e-6, 3)
 
-        # Detect TP1/TP2 from qty steps (generic-ish)
+        try:
+            self._fetch_mark_price(symbol)
+        except Exception:
+            pass
+
         if not st["tp1_seen"] and tp1_qty_threshold:
             prev = st["stage"]
             st["tp1_seen"] = 1
@@ -225,7 +238,6 @@ class WSStateManager:
             self._save_state(symbol, st)
             audit(symbol, prev, st["stage"], "detect_tp1_qty_drop", {"qty": qty}, {"ok": True}, True)
 
-            # v2.0: TP1触发时，同步移SL到保本
             if (not st["be_moved"]) and self._idempotent(st, symbol, "move_be_on_tp1"):
                 req = {"entry": entry, "trigger": f"tp1@{tp1_pct}%", "qty": qty}
                 try:
@@ -253,7 +265,6 @@ class WSStateManager:
             self._save_state(symbol, st)
             audit(symbol, prev, st["stage"], "detect_tp2_qty_drop", {"qty": qty}, {"ok": True}, True)
 
-        # After TP2, place trailing on remaining qty
         if st["tp2_seen"] and (not st["trailing_active"]):
             if self._idempotent(st, symbol, "place_trailing"):
                 prev = st["stage"]
@@ -273,28 +284,19 @@ class WSStateManager:
             self.simulate_run()
             return
 
+        alert("State Manager starting in REST polling mode (WebSocket removed)")
+
         backoffs = [1, 2, 5, 10]
         i = 0
         while True:
             try:
-                self._start_ws()
                 i = 0
                 while True:
-                    # Heartbeat degrade if ws stale >5s
-                    stale = time.time() - self.last_ws_tick > 5
-                    if stale and not self.degraded:
-                        self.degraded = True
-                        alert("WS heartbeat timeout >5s, entering degraded mode")
-                    elif (not stale) and self.degraded:
-                        self.degraded = False
-                        alert("WS heartbeat recovered, back to realtime mode")
-
                     for scfg in self.cfg["symbols"]:
                         if scfg.get("enabled", True):
                             self._check_symbol(scfg)
 
-                    # base every 60s; near TP use 10s
-                    sleep_s = 60
+                    sleep_s = POLL_INTERVAL_NORMAL
                     for scfg in self.cfg["symbols"]:
                         if not scfg.get("enabled", True):
                             continue
@@ -307,22 +309,17 @@ class WSStateManager:
                         tp1 = entry * (1 + float(scfg.get("tp1_trigger_pct", 3.0)) / 100)
                         tp2 = entry * (1 + float(scfg.get("tp2_trigger_pct", 4.0)) / 100)
                         if abs(p - tp1) / tp1 < 0.003 or abs(p - tp2) / tp2 < 0.003:
-                            sleep_s = 10
+                            sleep_s = POLL_INTERVAL_NEAR_TP
                             break
                     time.sleep(sleep_s)
             except Exception as e:
                 wait = backoffs[min(i, len(backoffs) - 1)]
                 i += 1
-                alert(f"WS loop error: {e}; reconnect in {wait}s")
-                try:
-                    self._stop_ws()
-                except Exception:
-                    pass
+                alert(f"REST poll loop error: {e}; retry in {wait}s")
                 time.sleep(wait)
 
     def simulate_run(self):
         symbol = self.cfg["symbols"][0]["symbol"]
-        # synthetic flow for state transitions
         stages = [
             ("INIT", "INIT", "boot", True),
             ("INIT", "TP1_OBSERVED", "detect_tp1_qty_drop", True),
@@ -344,7 +341,7 @@ def default_cfg():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="AKQ WS state manager")
+    ap = argparse.ArgumentParser(description="AKQ State Manager (REST polling mode)")
     ap.add_argument("--simulate", action="store_true", help="write one simulated state-transition flow")
     args = ap.parse_args()
 

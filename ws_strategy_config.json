@@ -1,11 +1,44 @@
 {
   "symbols": [
     {
+      "symbol": "BTCUSDT",
+      "enabled": true,
+      "role": "indicator",
+      "tp1_trigger_pct": 3.0,
+      "tp2_trigger_pct": 4.5,
+      "trail_callback_rate": 1.5
+    },
+    {
       "symbol": "ETHUSDT",
       "enabled": true,
+      "role": "main",
       "tp1_trigger_pct": 3.0,
       "tp2_trigger_pct": 4.0,
       "trail_callback_rate": 1.5
+    },
+    {
+      "symbol": "SOLUSDT",
+      "enabled": true,
+      "role": "main",
+      "tp1_trigger_pct": 3.5,
+      "tp2_trigger_pct": 5.0,
+      "trail_callback_rate": 2.0
+    },
+    {
+      "symbol": "XRPUSDT",
+      "enabled": true,
+      "role": "trial",
+      "tp1_trigger_pct": 3.0,
+      "tp2_trigger_pct": 4.5,
+      "trail_callback_rate": 2.0
+    },
+    {
+      "symbol": "AVAXUSDT",
+      "enabled": true,
+      "role": "trial",
+      "tp1_trigger_pct": 3.5,
+      "tp2_trigger_pct": 5.0,
+      "trail_callback_rate": 2.0
     }
   ]
 }

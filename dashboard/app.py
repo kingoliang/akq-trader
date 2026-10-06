@@ -291,6 +291,7 @@ def api_positions():
 @require_auth
 def api_orders():
     try:
+        # Regular open orders
         orders = client.futures_get_open_orders()
         result = []
         for o in orders:
@@ -303,8 +304,26 @@ def api_orders():
                 "price": o.get("price"),
                 "origQty": o.get("origQty"),
                 "status": o.get("status"),
+                "source": "regular",
             })
-        audit_logger.info("GET /api/orders | ip=%s | count=%d", request.remote_addr, len(result))
+        # Algo open orders (SL/TP via conditional orders)
+        try:
+            algo_orders = client.futures_get_open_algo_orders()
+            for o in algo_orders:
+                result.append({
+                    "orderId": o.get("algoId"),
+                    "symbol": o.get("symbol"),
+                    "type": o.get("orderType"),
+                    "side": o.get("side"),
+                    "stopPrice": o.get("triggerPrice"),
+                    "price": None,
+                    "origQty": o.get("quantity"),
+                    "status": o.get("algoStatus"),
+                    "source": "algo",
+                })
+        except Exception as ae:
+            audit_logger.info("GET /api/orders | algo query error: %s", str(ae))
+        audit_logger.info("GET /api/orders | ip=%s | count=%d (regular=%d algo=%d)", request.remote_addr, len(result), len([r for r in result if r["source"]=="regular"]), len([r for r in result if r["source"]=="algo"]))
         return jsonify({"ok": True, "data": result})
     except Exception as e:
         audit_logger.info("GET /api/orders | ip=%s | ERROR: %s", request.remote_addr, str(e))
@@ -582,14 +601,17 @@ def _open_position(symbol, usdt_amount, leverage, sl_pct, tp_pct, side, task_id=
         sl_price = round_step(entry_price * (1 + sl_pct / 100), info["tickSize"])
         sl_side = "BUY"
 
-    sl_order = client.futures_create_order(
+    # SL via Algo API (STOP_MARKET on /fapi/v1/order returns -4120, use algo order endpoint)
+    sl_order = client.futures_create_algo_order(
+        algoType='CONDITIONAL',
         symbol=symbol,
         side=sl_side,
         positionSide=side,
-        type="STOP_MARKET",
-        quantity=qty,
-        stopPrice=sl_price,
-        timeInForce="GTE_GTC",
+        type='STOP_MARKET',
+        triggerPrice=str(sl_price),
+        quantity=str(qty),
+        workingType='MARK_PRICE',
+        priceProtect='true',
     )
 
     # TP (optional)
@@ -603,16 +625,19 @@ def _open_position(symbol, usdt_amount, leverage, sl_pct, tp_pct, side, task_id=
             tp_price = round_step(entry_price * (1 - tp_pct / 100), info["tickSize"])
             tp_side = "BUY"
 
-        tp_order = client.futures_create_order(
+        # TP via Algo API (TAKE_PROFIT_MARKET on /fapi/v1/order returns -4120)
+        tp_order = client.futures_create_algo_order(
+            algoType='CONDITIONAL',
             symbol=symbol,
             side=tp_side,
             positionSide=side,
-            type="TAKE_PROFIT_MARKET",
-            quantity=qty,
-            stopPrice=tp_price,
-            timeInForce="GTE_GTC",
+            type='TAKE_PROFIT_MARKET',
+            triggerPrice=str(tp_price),
+            quantity=str(qty),
+            workingType='MARK_PRICE',
+            priceProtect='true',
         )
-        tp_order_id = tp_order.get("orderId")
+        tp_order_id = tp_order.get("algoId") or tp_order.get("clientAlgoId")
 
     # Write to DB
     try:
@@ -636,7 +661,7 @@ def _open_position(symbol, usdt_amount, leverage, sl_pct, tp_pct, side, task_id=
         "tpPrice": tp_price,
         "leverage": leverage,
         "usdtMargin": usdt_amount,
-        "slOrderId": sl_order.get("orderId"),
+        "slOrderId": sl_order.get("algoId") or sl_order.get("clientAlgoId"),
         "tpOrderId": tp_order_id,
     }
 
@@ -1367,7 +1392,7 @@ const grossPnl=(t)=>{
   const diff=Number(t.exit_price)-Number(t.entry_price);
   return side==='SHORT' ? (-diff*Number(t.qty)) : (diff*Number(t.qty));
 };
-const INITIAL_CAPITAL_USDT = 147.20; // Kingo 入金本金，可按需调整
+const INITIAL_CAPITAL_USDT = 238.47; // Kingo 累计入金本金（147.20 + 91.27）
 const DASH_TOKEN = new URLSearchParams(window.location.search).get('token');
 
 function updateLastRefresh(){
