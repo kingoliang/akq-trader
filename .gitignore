@@ -1,0 +1,26 @@
+# 密钥与凭据
+.api_token
+.dashboard_token
+.env
+.env.*
+*.pem
+*.key
+*_token
+*secret*
+
+# 运行环境
+.venv/
+__pycache__/
+*.pyc
+
+# 日志与运行时数据
+*.log
+*.jsonl
+
+# 数据库及备份
+*.db
+trades.db.bak*
+
+# 手工备份文件
+*.bak
+*.bak_*

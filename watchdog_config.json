@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+  "interval_seconds": 300,
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "AVAXUSDT",
+    "LINKUSDT"
+  ],
+  "alerts": {
+    "pnl_gain_pct": 1.0,
+    "pnl_loss_pct": 1.0,
+    "price_near_sl_pct": 3.0,
+    "rsi_high": 75,
+    "rsi_low": 30
+  }
+}
